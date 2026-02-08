@@ -5,9 +5,17 @@
 !rust_implem/
 !rust_implem/**
 
+# Allow the Python tools
+!tools/
+!tools/**
+
 # Allow top-level files
 !.gitignore
 !README.md
 
 # Rust build artifacts
 rust_implem/target/
+
+# Python bytecode
+__pycache__/
+*.pyc

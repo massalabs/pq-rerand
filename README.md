@@ -66,26 +66,28 @@ Batch operations are embarrassingly parallel across slots (not yet parallelized 
 
 ```
 pq-rerand/
-├── rust_implem/          # Rust reference implementation (~1050 LOC)
+├── rust_implem/               # Rust reference implementation (~1050 LOC)
 │   ├── Cargo.toml
 │   ├── src/
-│   │   ├── lib.rs        # Crate root
-│   │   ├── params.rs     # Scheme parameters and constants
-│   │   ├── ntt.rs        # Number Theoretic Transform (negacyclic)
-│   │   ├── poly.rs       # CRT polynomial types and ring arithmetic
-│   │   ├── sampling.rs   # Gaussian and uniform sampling
-│   │   ├── encoding.rs   # 31-bit plaintext encoding (bytes ↔ coefficients)
-│   │   ├── keygen.rs     # Key generation
-│   │   ├── encrypt.rs    # Encryption with optional noise flooding
-│   │   ├── rerandomize.rs# Public re-randomization
-│   │   ├── decrypt.rs    # Decryption via noise-limb trick
-│   │   └── serialize.rs  # Ciphertext serialization
+│   │   ├── lib.rs             # Crate root
+│   │   ├── params.rs          # Scheme parameters and constants
+│   │   ├── ntt.rs             # Number Theoretic Transform (negacyclic)
+│   │   ├── poly.rs            # CRT polynomial types and ring arithmetic
+│   │   ├── sampling.rs        # Gaussian and uniform sampling
+│   │   ├── encoding.rs        # 31-bit plaintext encoding (bytes ↔ coefficients)
+│   │   ├── keygen.rs          # Key generation
+│   │   ├── encrypt.rs         # Encryption with optional noise flooding
+│   │   ├── rerandomize.rs     # Public re-randomization
+│   │   ├── decrypt.rs         # Decryption via noise-limb trick
+│   │   └── serialize.rs       # Ciphertext serialization
 │   ├── benches/
-│   │   └── bench.rs      # Criterion benchmarks
+│   │   └── bench.rs           # Criterion benchmarks
 │   └── tests/
-│       └── correctness.rs# Integration tests (22 tests total)
-├── paper/                # LaTeX source of the accompanying paper
-├── tools/                # Python scripts (noise simulation, figures, lattice estimator)
+│       └── correctness.rs     # Integration tests (22 tests total)
+├── tools/                     # Python scripts for analysis and figures
+│   ├── make_figures.py        # Generate publication figures (requires numpy, matplotlib, scipy)
+│   ├── security_estimate.py   # HE Standard v1.1 security cross-check (pure Python)
+│   └── lattice_estimate_sage.py  # Lattice-estimator script (requires SageMath)
 └── README.md
 ```
 
@@ -96,6 +98,20 @@ cd rust_implem
 cargo build --release
 cargo test --release
 cargo bench
+```
+
+## Running the analysis tools
+
+```bash
+# Generate publication figures (outputs to paper/figures/)
+pip install numpy matplotlib scipy
+python3 tools/make_figures.py
+
+# Quick security check (pure Python, no dependencies)
+python3 tools/security_estimate.py
+
+# Full lattice-estimator analysis (requires SageMath + lattice-estimator)
+sage tools/lattice_estimate_sage.py
 ```
 
 ## How it works
