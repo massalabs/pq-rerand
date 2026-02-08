@@ -1,0 +1,13 @@
+# Ignore everything
+*
+
+# Allow the Rust implementation
+!rust_implem/
+!rust_implem/**
+
+# Allow top-level files
+!.gitignore
+!README.md
+
+# Rust build artifacts
+rust_implem/target/

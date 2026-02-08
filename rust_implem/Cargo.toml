@@ -1,0 +1,16 @@
+[package]
+name = "pq-rerand"
+version = "0.1.0"
+edition = "2021"
+description = "Post-quantum re-randomizable encryption (BFV/LPR + CRT noise-limb trick). NOT PRODUCTION READY."
+
+[dependencies]
+rand = "0.8"
+rand_distr = "0.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench"
+harness = false
