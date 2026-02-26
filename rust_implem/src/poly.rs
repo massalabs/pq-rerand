@@ -65,7 +65,7 @@ pub struct NttContext {
 }
 
 impl NttContext {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         NttContext {
             tables_t: NttTables::new(T),
             tables_q2: NttTables::new(Q2),
