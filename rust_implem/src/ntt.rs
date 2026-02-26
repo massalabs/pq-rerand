@@ -11,25 +11,25 @@ use crate::params::N;
 
 /// Modular multiplication: (a * b) mod m, via u64.
 #[inline(always)]
-pub fn mulmod(a: u32, b: u32, m: u32) -> u32 {
+pub const fn mulmod(a: u32, b: u32, m: u32) -> u32 {
     ((a as u64 * b as u64) % m as u64) as u32
 }
 
 /// Modular addition: (a + b) mod m.
 #[inline(always)]
-pub fn addmod(a: u32, b: u32, m: u32) -> u32 {
+pub const fn addmod(a: u32, b: u32, m: u32) -> u32 {
     let s = a as u64 + b as u64;
     (if s >= m as u64 { s - m as u64 } else { s }) as u32
 }
 
 /// Modular subtraction: (a - b) mod m.
 #[inline(always)]
-pub fn submod(a: u32, b: u32, m: u32) -> u32 {
+pub const fn submod(a: u32, b: u32, m: u32) -> u32 {
     if a >= b { a - b } else { (a as u64 + m as u64 - b as u64) as u32 }
 }
 
 /// Modular exponentiation: base^exp mod m.
-pub fn powmod(base: u32, mut exp: u64, m: u32) -> u32 {
+pub const fn powmod(base: u32, mut exp: u64, m: u32) -> u32 {
     let mut result: u64 = 1;
     let mut b = base as u64 % m as u64;
     let modulus = m as u64;
@@ -42,17 +42,20 @@ pub fn powmod(base: u32, mut exp: u64, m: u32) -> u32 {
 }
 
 /// Find a primitive 2N-th root of unity modulo p.
-fn find_psi(p: u32) -> u32 {
+const fn find_psi(p: u32) -> u32 {
     let two_n = 2 * N as u64;
     let exp = (p as u64 - 1) / two_n;
-    for g in 2u32..200 {
+    let mut g = 2u32;
+    while g < 200 {
         let w = powmod(g, exp, p);
-        if w == 0 || w == 1 { continue; }
-        // Check order is exactly 2N: w^N ≡ -1 (mod p)
-        let w_n = powmod(w, N as u64, p);
-        if w_n == p - 1 { return w; }
+        if w != 0 && w != 1 {
+            // Check order is exactly 2N: w^N ≡ -1 (mod p)
+            let w_n = powmod(w, N as u64, p);
+            if w_n == p - 1 { return w; }
+        }
+        g += 1;
     }
-    panic!("No 2N-th root of unity found for p={}", p);
+    panic!("No 2N-th root of unity found");
 }
 
 /// Bit-reverse an index in log2(N) bits.
@@ -72,12 +75,12 @@ pub struct NttTables {
     omega_inv: u32,  // omega^{-1} mod p
     n_inv: u32,      // N^{-1} mod p
     // Precomputed: psi_table[i] = psi^i for i = 0..N-1
-    psi_table: Vec<u32>,
-    psi_inv_table: Vec<u32>,
+    psi_table: [u32; N],
+    psi_inv_table: [u32; N],
 }
 
 impl NttTables {
-    pub fn new(p: u32) -> Self {
+    pub const fn new(p: u32) -> Self {
         let psi = find_psi(p);
         let psi_inv = powmod(psi, p as u64 - 2, p);
         let omega = mulmod(psi, psi, p); // ω = ψ²
@@ -85,13 +88,15 @@ impl NttTables {
         let n_inv = powmod(N as u32, p as u64 - 2, p);
 
         // psi_table[i] = psi^i
-        let mut psi_table = vec![0u32; N];
-        let mut psi_inv_table = vec![0u32; N];
+        let mut psi_table = [0u32; N];
+        let mut psi_inv_table = [0u32; N];
         psi_table[0] = 1;
         psi_inv_table[0] = 1;
-        for i in 1..N {
+        let mut i = 1;
+        while i < N {
             psi_table[i] = mulmod(psi_table[i - 1], psi, p);
             psi_inv_table[i] = mulmod(psi_inv_table[i - 1], psi_inv, p);
+            i += 1;
         }
 
         NttTables {
@@ -214,6 +219,10 @@ pub fn pointwise_sub(a: &[u32; N], b: &[u32; N], p: u32) -> [u32; N] {
 mod tests {
     use super::*;
     use crate::params::{T, Q2};
+
+    /// Verify NTT tables are computed at compile time.
+    const _: NttTables = NttTables::new(T);
+    const _: NttTables = NttTables::new(Q2);
 
     #[test]
     fn test_ntt_roundtrip_t() {
