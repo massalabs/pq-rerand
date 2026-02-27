@@ -4,13 +4,13 @@ use crate::params::{N, T, Q2, SIGMA};
 use crate::poly::{Poly, NttContext};
 use crate::sampling::{sample_gaussian, sample_uniform};
 use rand::Rng;
-use zeroize::{Zeroizing, ZeroizeOnDrop};
+use zeroize::{Zeroize, Zeroizing, ZeroizeOnDrop};
 
 /// Secret key: the secret polynomial s reduced into both CRT limbs.
 ///
 /// Zeroized on drop to prevent secret material from lingering in memory.
 /// Does not implement `Debug` to prevent accidental logging of secrets.
-#[derive(Clone, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SecretKey {
     pub s_t: [u32; N],
     pub s_q2: [u32; N],
