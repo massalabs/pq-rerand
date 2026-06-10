@@ -23,13 +23,26 @@ pub const DELTA_T: u32 = {
 pub const INV_DELTA_T: u32 = 1_987_184_532;
 
 /// Narrow Gaussian standard deviation (for keygen, rerand, base encrypt).
+/// Matches the paper's σ = 3.2.
 pub const SIGMA: f64 = 3.2;
 
-/// Default re-randomization budget.
-pub const K_MAX: u64 = 858_000_000;
+/// Flood "virtual re-randomization count" κ_f (paper §6). The flood packet is
+/// equivalent, for the noise budget, to κ_f extra re-randomizations.
+pub const KAPPA_F: u64 = 858_000_000;
 
-/// Flood Gaussian standard deviation: σ · √k_max.
-pub const SIGMA_FLOOD: f64 = SIGMA * 29_292.4; // √858_000_000 ≈ 29292.4, so σ_flood ≈ 93735.7
+/// Flood Gaussian standard deviation σ_f = σ · √κ_f ≈ 93,733 (paper §6).
+/// 3.2 · √858_000_000 = 3.2 · 29291.6368… = 93733.236…
+pub const SIGMA_FLOOD: f64 = 93_733.236;
+
+/// Noise-budget threshold: a coefficient decrypts correctly iff |ν| < q₂/2
+/// (paper Theorem 4.3). With q₂ ≈ 2³², q₂/2 ≈ 2.147 × 10⁹.
+pub const NOISE_THRESHOLD: u32 = Q2 / 2;
+
+/// Maximum *additional* public re-randomizations on top of the flood baseline
+/// guaranteed by the fixed-key batch bound (paper Remark 4.7 / Table 6,
+/// p_batch = 2⁻¹⁰⁶, B = 1024): k_max ≈ 1.4 × 10¹⁰. Documented for reference;
+/// the analytic bound itself lives in `tools/`.
+pub const K_MAX_RERAND: u64 = 14_000_000_000;
 
 /// Number of slots for 15.5 MiB plaintext.
 pub const NUM_SLOTS: usize = 1024;
@@ -73,8 +86,14 @@ mod tests {
 
     #[test]
     fn test_sigma_flood() {
-        let expected = SIGMA * (K_MAX as f64).sqrt();
+        // σ_f must equal σ·√κ_f to match the paper's flood calibration.
+        let expected = SIGMA * (KAPPA_F as f64).sqrt();
         let diff = (SIGMA_FLOOD - expected).abs();
-        assert!(diff < 10.0, "SIGMA_FLOOD is off: {} vs {}", SIGMA_FLOOD, expected);
+        assert!(diff < 0.5, "SIGMA_FLOOD is off: {} vs {}", SIGMA_FLOOD, expected);
+    }
+
+    #[test]
+    fn test_noise_threshold() {
+        assert_eq!(NOISE_THRESHOLD, Q2 / 2);
     }
 }
