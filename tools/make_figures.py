@@ -236,7 +236,9 @@ if k_show in sim_per_key:
     ax.set_xlabel('Key index')
     ax.set_ylabel('Mean max $|\\nu|$ ($\\times 10^8$)')
     ax.set_title(f'Inter-Key Variability at $k={k_show}$ ({NUM_TRIALS_PER_KEY} trials/key)')
-    ax.legend(framealpha=0.9)
+    # Mid-height placement keeps the legend clear of the bar tops and the
+    # cross-key mean line.
+    ax.legend(framealpha=0.9, loc='center right')
     ax.set_xticks(range(0, NUM_KEYS, 2))
     ax.grid(True, alpha=0.2, axis='y')
 
