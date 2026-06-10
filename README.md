@@ -16,11 +16,17 @@ This construction is engineered around a **two-limb CRT modulus** `q = t · q₂
 - **Large plaintext blocks**: ~15.5 KiB per ciphertext slot, ~15.5 MiB per batch of 1024 slots
 - **Simple 32-bit NTT** implementation (both CRT primes < 2³², all intermediate products fit in u64)
 
-## Warning
+## Security & side-channel posture
 
-**This implementation is a research prototype for academic evaluation only.**
+**This implementation has not yet been externally audited.** It is written to production-quality standards and is intended to be audit-ready:
 
-It has NOT been audited, is NOT constant-time, does NOT protect against side-channel attacks, and MUST NOT be used in any production system. The Gaussian sampler uses floating-point Box-Muller, which is biased in the tails and leaks timing information.
+- The base-width Gaussian sampler (keygen, base encryption, re-randomization) is a **constant-time CDT** discrete-Gaussian sampler (fixed-length branchless table scan).
+- The flood-width sampler is a **branchless constant-time inverse-CDF** sampler (no rejection loop, no data-dependent branch or table indexing).
+- The NTT / modular-arithmetic layer — including the secret-dependent decryption path (center-lift and final reduction) — is **branchless and division-free by construction**: control flow and memory-access patterns are independent of operand values.
+- All RNG inputs are bounded by `rand::CryptoRng`, enforcing a CSPRNG at the type level. Secret keys are zeroized on drop; transient secrets are zeroized best-effort. The library is `#![forbid(unsafe_code)]`.
+- A TVLA/dudect-style fixed-vs-random timing-leakage harness (`cargo run --release --example leakage`) reports no measurable leakage (Welch |t| < 4.5) on the encryption, re-randomization and decryption paths, while flagging a deliberately variable-time control (|t| > 3000). The harness also includes a hardware diagnostic: on CPUs with data-dependent bit-toggle timing (observed on Zen 4), *all-zero* vs random data content is distinguishable at the ~0.02% level even for a pure load loop with no crypto arithmetic; AEAD-wrapped payloads (the intended deployment) are uniformly random, so such degenerate inputs cannot occur.
+
+Branchless source plus one leakage run is not a substitute for microarchitectural verification: production deployments should repeat the timing-leakage assessment on their target platform (desktop and mobile) and an external audit is recommended before production use.
 
 ## Parameters
 
@@ -52,38 +58,57 @@ With a per-batch failure probability of 2⁻¹⁰⁶ and B = 1024 slots:
 
 ## Benchmark results
 
-Single-threaded, `--release` mode, no SIMD intrinsics. Measured on AMD Ryzen 7 (Zen 4, 3.8 GHz base / 5.0 GHz boost), 32 GiB DDR5, Linux 6.17, rustc 1.91.1.
+Measured on AMD Ryzen 7 260 (8C/16T, Zen 4, 3.8 GHz base / 5.0 GHz boost), 32 GiB DDR5, Linux 7.0, rustc 1.94.1, `--release` with `RUSTFLAGS="-C target-cpu=native"` (auto-vectorized; no hand-written SIMD intrinsics). Criterion medians.
 
-| Operation | Per ciphertext slot | Full batch (1024 slots) |
-|-----------|--------------------:|------------------------:|
-| Encrypt (base + flood) | 2.6 ms | 2.7 s |
-| Re-randomize | 1.3 ms | 1.4 s |
-| Decrypt | 1.2 ms | 1.2 s |
+**Fixed-frequency config** (reproducible: `cpupower frequency-set -g performance`, turbo boost disabled, all cores pinned at 3.8 GHz):
 
-Batch operations are embarrassingly parallel across slots (not yet parallelized in this reference implementation).
+| Operation | 1 thread | 16 threads (per slot, B=1024) |
+|-----------|---------:|------------------------------:|
+| Key generation | 0.92 ms | — |
+| Encrypt (base + folded flood) | 0.80 ms | 0.096 ms |
+| Re-randomize | 0.51 ms | 0.070 ms |
+| Decrypt | 0.21 ms | 0.025 ms |
+
+With turbo boost enabled (OS-default scaling): encrypt 0.63 ms, re-randomize 0.41 ms, decrypt 0.16 ms (single thread).
+
+Versus the original reference implementation at the same fixed frequency (encrypt 3.24 ms, re-randomize 1.62 ms, decrypt 1.47 ms), the optimized arithmetic (Barrett reduction, Shoup-multiply butterflies with precomputed bit-reversed twiddles, folded flooding, cached key NTT) is **3.1–7.1× faster** single-threaded; rayon batch operations add a further ~7–8× across 16 hardware threads. A full 15.5 MiB batch (1024 slots) re-randomizes in 0.072 s and decrypts in 0.026 s on 16 threads.
+
+Reproduce with:
+
+```bash
+sudo cpupower frequency-set -g performance
+echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost
+RUSTFLAGS="-C target-cpu=native" cargo bench               # criterion
+RUSTFLAGS="-C target-cpu=native" cargo run --release --example timings
+RUSTFLAGS="-C target-cpu=native" cargo run --release --example leakage
+```
 
 ## Repository structure
 
 ```
 pq-rerand/
-├── rust_implem/               # Rust reference implementation (~1050 LOC)
+├── rust_implem/               # Rust implementation (~1550 LOC)
 │   ├── Cargo.toml
 │   ├── src/
-│   │   ├── lib.rs             # Crate root
+│   │   ├── lib.rs             # Crate root (forbid(unsafe_code), security notes)
 │   │   ├── params.rs          # Scheme parameters and constants
-│   │   ├── ntt.rs             # Number Theoretic Transform (negacyclic)
+│   │   ├── ntt.rs             # Negacyclic NTT (Barrett/Shoup, branchless, const tables)
 │   │   ├── poly.rs            # CRT polynomial types and ring arithmetic
-│   │   ├── sampling.rs        # Gaussian and uniform sampling
+│   │   ├── sampling.rs        # Constant-time CDT + inverse-CDF Gaussian samplers
 │   │   ├── encoding.rs        # 31-bit plaintext encoding (bytes ↔ coefficients)
-│   │   ├── keygen.rs          # Key generation
-│   │   ├── encrypt.rs         # Encryption with optional noise flooding
+│   │   ├── keygen.rs          # Key generation (zeroized secret key, cached NTT)
+│   │   ├── encrypt.rs         # Encryption with folded noise flooding
 │   │   ├── rerandomize.rs     # Public re-randomization
-│   │   ├── decrypt.rs         # Decryption via noise-limb trick
-│   │   └── serialize.rs       # Ciphertext serialization
+│   │   ├── decrypt.rs         # Branchless decryption via noise-limb trick
+│   │   ├── serialize.rs       # Validated ciphertext (de)serialization
+│   │   └── batch.rs           # Multi-threaded (rayon) batch operations
 │   ├── benches/
 │   │   └── bench.rs           # Criterion benchmarks
+│   ├── examples/
+│   │   ├── leakage.rs         # TVLA/dudect timing-leakage harness (x86_64 + aarch64)
+│   │   └── timings.rs         # Standalone timing harness (single + batch, 1/N threads)
 │   └── tests/
-│       └── correctness.rs     # Integration tests (22 tests total)
+│       └── correctness.rs     # Integration tests
 ├── tools/                     # Python scripts for analysis and figures
 │   ├── make_figures.py        # Generate publication figures (requires numpy, matplotlib, scipy)
 │   ├── security_estimate.py   # HE Standard v1.1 security cross-check (pure Python)
@@ -95,10 +120,13 @@ pq-rerand/
 
 ```bash
 cd rust_implem
-cargo build --release
+cargo build --release    # portable build
 cargo test --release
-cargo bench
+cargo clippy --all-targets -- -D warnings
+RUSTFLAGS="-C target-cpu=native" cargo bench   # benchmarks with host SIMD
 ```
+
+The crate is portable across desktop and mobile targets (pure safe Rust, no architecture-specific intrinsics in the library; verified to build for `aarch64-unknown-linux-gnu`).
 
 ## Running the analysis tools
 

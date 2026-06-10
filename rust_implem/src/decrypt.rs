@@ -5,10 +5,11 @@
 //! and multiply by INV_DELTA_T to recover M.
 
 use crate::params::{N, T, Q2, INV_DELTA_T};
-use crate::ntt::{mulmod, submod};
+use crate::ntt::{barrett_mu, barrett_reduce, csub, submod};
 use crate::poly::NttContext;
 use crate::keygen::SecretKey;
 use crate::encrypt::CiphertextSlot;
+use zeroize::Zeroize;
 
 /// Decrypt a single ciphertext slot, returning the message polynomial
 /// coefficients in [0, t).
@@ -17,24 +18,22 @@ pub fn decrypt_slot(
     sk: &SecretKey,
     ct: &CiphertextSlot,
 ) -> [u32; N] {
-    // Compute c1 * s in each limb via NTT
-    // c1 is in coefficient domain; we need to NTT it, pointwise-mul with NTT(s), INTT.
+    // Compute c1 * s in each limb via NTT. c1 is in coefficient domain, so it is
+    // forward-transformed here; s is already cached in the NTT domain (see
+    // `SecretKey`), saving two forward transforms per decryption.
     let mut c1_ntt_t = ct.c1_t;
     let mut c1_ntt_q2 = ct.c1_q2;
     ctx.tables_t.forward(&mut c1_ntt_t);
     ctx.tables_q2.forward(&mut c1_ntt_q2);
 
-    let mut s_ntt_t = sk.s_t;
-    let mut s_ntt_q2 = sk.s_q2;
-    ctx.tables_t.forward(&mut s_ntt_t);
-    ctx.tables_q2.forward(&mut s_ntt_q2);
-
     // c1*s in NTT domain
+    let mu_t = barrett_mu(T);
+    let mu_q2 = barrett_mu(Q2);
     let mut cs_ntt_t = [0u32; N];
     let mut cs_ntt_q2 = [0u32; N];
     for i in 0..N {
-        cs_ntt_t[i] = mulmod(c1_ntt_t[i], s_ntt_t[i], T);
-        cs_ntt_q2[i] = mulmod(c1_ntt_q2[i], s_ntt_q2[i], Q2);
+        cs_ntt_t[i] = barrett_reduce(c1_ntt_t[i] as u64 * sk.s_ntt_t[i] as u64, T, mu_t);
+        cs_ntt_q2[i] = barrett_reduce(c1_ntt_q2[i] as u64 * sk.s_ntt_q2[i] as u64, Q2, mu_q2);
     }
 
     // INTT to get c1*s in coefficient domain
@@ -49,22 +48,33 @@ pub fn decrypt_slot(
         v_q2[i] = submod(ct.c0_q2[i], cs_ntt_q2[i], Q2);
     }
 
-    // Noise-limb trick: v_q2 is pure noise.
-    // Center-lift to signed, then recover M from v_t.
-    let half_q2 = Q2 / 2;
+    // Noise-limb trick: v_q2 is pure noise. The center-lift and final reduction
+    // run on secret-dependent values, so they are done branchlessly (constant-time):
+    // no data-dependent control flow and no data-indexed memory access.
+    let half_q2 = (Q2 / 2) as u64;
+    let q2_i = Q2 as i64;
+    let t_u = T as u64;
+    let t_i = T as i64;
     let mut message = [0u32; N];
     for i in 0..N {
-        // Center-lift noise from q₂-limb
-        let noise_i: i64 = if v_q2[i] <= half_q2 {
-            v_q2[i] as i64
-        } else {
-            v_q2[i] as i64 - Q2 as i64
-        };
+        let v = v_q2[i] as u64;
+        // gt_mask = all-ones iff v > q₂/2 (i.e. the center-lift maps v ↦ v − q₂).
+        let gt_mask = (half_q2.wrapping_sub(v) >> 63).wrapping_neg();
+        let noise = v as i64 - (q2_i & gt_mask as i64); // ∈ [−q₂/2, q₂/2]
 
-        // M = (v_t - noise) * INV_DELTA_T mod t
-        let tmp = (v_t[i] as i64 - noise_i).rem_euclid(T as i64);
-        message[i] = mulmod(tmp as u32, INV_DELTA_T, T);
+        // M = (v_t − noise) · Δ_t⁻¹ mod t. The value (v_t − noise) ∈ (−T, 3T);
+        // shift by +T into (0, 3T) and reduce with two branchless subtractions.
+        let u = ((v_t[i] as i64 - noise) + t_i) as u64;
+        let u = csub(csub(u, t_u), t_u);
+        message[i] = barrett_reduce(u * INV_DELTA_T as u64, T, mu_t);
     }
+
+    // Best-effort scrubbing of secret-derived intermediates (c1·s and the
+    // decryption noise).
+    cs_ntt_t.zeroize();
+    cs_ntt_q2.zeroize();
+    v_t.zeroize();
+    v_q2.zeroize();
 
     message
 }

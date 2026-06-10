@@ -40,8 +40,8 @@ fn test_encrypt_decrypt_random() {
     let (sk, pk, ctx, mut rng) = setup();
     // Random message with 31-bit coefficients
     let mut message = [0u32; N];
-    for i in 0..N {
-        message[i] = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
+    for c in message.iter_mut() {
+        *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
     }
     let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
     let recovered = decrypt_slot(&ctx, &sk, &ct);
@@ -62,8 +62,8 @@ fn test_encrypt_decrypt_max_values() {
 fn test_rerand_preserves_plaintext() {
     let (sk, pk, ctx, mut rng) = setup();
     let mut message = [0u32; N];
-    for i in 0..N {
-        message[i] = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
+    for c in message.iter_mut() {
+        *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
     }
     let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
     let ct2 = rerandomize_slot(&mut rng, &ctx, &pk, &ct);
@@ -75,8 +75,8 @@ fn test_rerand_preserves_plaintext() {
 fn test_multiple_rerands() {
     let (sk, pk, ctx, mut rng) = setup();
     let mut message = [0u32; N];
-    for i in 0..N {
-        message[i] = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
+    for c in message.iter_mut() {
+        *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
     }
     let mut ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
     // Apply 100 re-randomizations
@@ -88,12 +88,55 @@ fn test_multiple_rerands() {
 }
 
 #[test]
+fn test_encrypt_decrypt_no_flood() {
+    // Flooding is optional (paper §6): σ_f = 0 disables it entirely.
+    let (sk, pk, ctx, mut rng) = setup();
+    let mut message = [0u32; N];
+    for c in message.iter_mut() {
+        *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
+    }
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, 0.0);
+    let ct2 = rerandomize_slot(&mut rng, &ctx, &pk, &ct);
+    let recovered = decrypt_slot(&ctx, &sk, &ct2);
+    assert_eq!(message, recovered, "no-flood roundtrip failed");
+}
+
+#[test]
+fn test_serialization_roundtrip_via_crypto() {
+    use pq_rerand::serialize::{serialize_slot, deserialize_slot};
+    let (sk, pk, ctx, mut rng) = setup();
+    let mut message = [0u32; N];
+    for c in message.iter_mut() {
+        *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
+    }
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct2 = deserialize_slot(&serialize_slot(&ct)).expect("valid ciphertext rejected");
+    let recovered = decrypt_slot(&ctx, &sk, &ct2);
+    assert_eq!(message, recovered, "serialize→deserialize→decrypt failed");
+}
+
+#[test]
+fn test_key_serialization_rejects_out_of_range() {
+    use pq_rerand::keygen::{PublicKey, SecretKey};
+    let (sk, pk, _ctx, _rng) = setup();
+
+    let mut pk_bytes = pk.to_bytes();
+    pk_bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(PublicKey::from_bytes(&pk_bytes).is_none(), "out-of-range pk accepted");
+
+    let sk_bytes = sk.to_bytes();
+    let mut bad = sk_bytes.to_vec();
+    bad[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(SecretKey::from_bytes(&bad).is_none(), "out-of-range sk accepted");
+}
+
+#[test]
 fn test_encoding_roundtrip_via_crypto() {
     let (sk, pk, ctx, mut rng) = setup();
     // Create a realistic plaintext slot from bytes
     let mut data = vec![0u8; SLOT_BYTES];
-    for i in 0..data.len() {
-        data[i] = rand::Rng::gen(&mut rng);
+    for b in data.iter_mut() {
+        *b = rand::Rng::gen(&mut rng);
     }
     let message = encode(&data);
     let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);

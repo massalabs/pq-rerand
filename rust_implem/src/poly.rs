@@ -6,15 +6,30 @@
 use crate::ntt::{NttTables, pointwise_mul, pointwise_add, pointwise_sub};
 use crate::params::{N, T, Q2};
 
+/// Branchless reduction of a small signed coefficient into `[0, m)`.
+///
+/// Precondition: `|c| < m` (always satisfied by the Gaussian widths used here —
+/// base σ = 3.2 and flood σ_f ≈ 93 733 are both astronomically smaller than the
+/// 31-/32-bit moduli). Adds `m` iff `c` is negative, using an arithmetic-shift
+/// mask, so there is no data-dependent branch and no division.
+#[inline(always)]
+fn reduce_signed_small(c: i64, m: u32) -> u32 {
+    let mask = c >> 63; // -1 (all ones) if c < 0, else 0
+    (c + (m as i64 & mask)) as u32
+}
+
 /// A polynomial in R_q represented in CRT form (coefficient domain).
 /// `limb_t[i]` is the i-th coefficient mod t; `limb_q2[i]` mod q₂.
 #[derive(Clone, Debug)]
 pub struct Poly {
+    /// Coefficients modulo `t`.
     pub limb_t: [u32; N],
+    /// Coefficients modulo `q₂`.
     pub limb_q2: [u32; N],
 }
 
 impl Poly {
+    /// The zero polynomial.
     pub fn zero() -> Self {
         Poly {
             limb_t: [0u32; N],
@@ -28,8 +43,8 @@ impl Poly {
         let mut limb_t = [0u32; N];
         let mut limb_q2 = [0u32; N];
         for i in 0..N {
-            limb_t[i] = coeffs[i].rem_euclid(T as i64) as u32;
-            limb_q2[i] = coeffs[i].rem_euclid(Q2 as i64) as u32;
+            limb_t[i] = reduce_signed_small(coeffs[i], T);
+            limb_q2[i] = reduce_signed_small(coeffs[i], Q2);
         }
         Poly { limb_t, limb_q2 }
     }
@@ -51,20 +66,27 @@ impl Poly {
     }
 }
 
-/// A polynomial in NTT evaluation form (one limb).
-#[derive(Clone)]
-pub struct NttPoly {
-    pub coeffs: [u32; N],
-    pub modulus: u32,
-}
-
 /// Precomputed NTT context holding tables for both primes.
 pub struct NttContext {
+    /// Tables for the plaintext-limb prime `t`.
     pub tables_t: NttTables,
+    /// Tables for the noise-limb prime `q₂`.
     pub tables_q2: NttTables,
 }
 
+/// Shared NTT context (twiddle tables for both primes). `NttContext::new` is a
+/// `const fn`, so this static is built at compile time (no runtime table setup).
+/// Used where a context is needed outside the hot path (e.g. key deserialization).
+pub static NTT_CONTEXT: NttContext = NttContext::new();
+
+impl Default for NttContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NttContext {
+    /// Build the context (const-evaluable; see [`NTT_CONTEXT`]).
     pub const fn new() -> Self {
         NttContext {
             tables_t: NttTables::new(T),
@@ -99,29 +121,24 @@ impl NttContext {
         let mut c_ntt_q2 = pointwise_mul(&a_ntt_q2, &b_ntt_q2, Q2);
         self.inverse(&mut c_ntt_t, &mut c_ntt_q2)
     }
-
-    /// Ring multiply-accumulate: result += a * b (in NTT domain for efficiency).
-    /// Takes a and b already in NTT form.
-    pub fn ntt_mul_acc(
-        acc_t: &mut [u32; N],
-        acc_q2: &mut [u32; N],
-        a_ntt_t: &[u32; N],
-        a_ntt_q2: &[u32; N],
-        b_ntt_t: &[u32; N],
-        b_ntt_q2: &[u32; N],
-    ) {
-        for i in 0..N {
-            let pt = (a_ntt_t[i] as u64 * b_ntt_t[i] as u64) % T as u64;
-            acc_t[i] = ((acc_t[i] as u64 + pt) % T as u64) as u32;
-            let pq = (a_ntt_q2[i] as u64 * b_ntt_q2[i] as u64) % Q2 as u64;
-            acc_q2[i] = ((acc_q2[i] as u64 + pq) % Q2 as u64) as u32;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reduce_signed_small_matches_rem_euclid() {
+        for &m in &[T, Q2] {
+            for c in -1_000_000i64..=1_000_000 {
+                assert_eq!(reduce_signed_small(c, m) as i64, c.rem_euclid(m as i64), "c={c} m={m}");
+            }
+            // larger magnitudes still within (-m, m)
+            for &c in &[-(m as i64 - 1), -(m as i64) / 2, m as i64 / 2, m as i64 - 1] {
+                assert_eq!(reduce_signed_small(c, m) as i64, c.rem_euclid(m as i64), "c={c} m={m}");
+            }
+        }
+    }
 
     #[test]
     fn test_poly_add_sub() {
