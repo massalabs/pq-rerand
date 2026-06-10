@@ -22,13 +22,17 @@ import os, math
 # Parameters
 N = 4096
 SIGMA = 3.2
-K_MAX = 858_000_000
+K_MAX = 858_000_000  # flood virtual count kappa_f (paper §6)
 Q2 = 4_294_828_033
 THRESHOLD = Q2 / 2
 # Fixed-key sub-Gaussian bound: sigma_k * sqrt(2*(4*N*SIGMA^2 + 1)*ln(2/delta))
 # with delta = 2^{-128}
 SG_CONST_SQ = 2 * (4 * N * SIGMA**2 + 1) * (math.log(2) * 129)
 SIGMA_FLOOD = SIGMA * math.sqrt(K_MAX)
+# k_max from the paper's Eq. (6): largest k with B_coeff(k, 2^-128) <= q2/2,
+# i.e. the point where the sub-Gaussian bound crosses the threshold.
+K_MAX_RERAND = (THRESHOLD / (SIGMA * math.sqrt(SG_CONST_SQ)))**2 - 1 - K_MAX
+print(f"k_max (analytic, with flooding) = {K_MAX_RERAND:.3e}")
 
 NUM_KEYS = 10
 NUM_TRIALS_PER_KEY = 5
@@ -118,8 +122,8 @@ print(f"  Fitted A = {A:.2f}")
 
 fig, ax = plt.subplots(figsize=(7, 4.5))
 
-# Extrapolated model
-k_extrap = np.logspace(0, np.log10(2 * K_MAX), 500)
+# Extrapolated model (out to 2 * k_max so the bound/threshold crossing is visible)
+k_extrap = np.logspace(0, np.log10(2 * K_MAX_RERAND), 500)
 noise_model = A * np.sqrt(K_MAX + 1 + k_extrap)
 # Sub-Gaussian bound: B_coeff(k) = sigma_k * sqrt(SG_CONST_SQ)
 # where sigma_k = sigma * sqrt(k + 1 + K_MAX)
@@ -139,15 +143,15 @@ stds = np.array([sim_results[k][1] for k in SIM_K[1:]])
 ax.errorbar(k_pts, means / 1e8, yerr=stds / 1e8, fmt='ko', markersize=4,
             capsize=3, label=f'Fixed-key sim ({NUM_KEYS} keys, {NUM_TRIALS_PER_KEY} trials/key)', zorder=5)
 
-ax.axvline(K_MAX, color='gray', linestyle='-.', alpha=0.7, linewidth=1)
-ax.text(K_MAX * 0.6, 0.3, '$k_{\\max}$', color='gray', fontsize=10, ha='right')
+ax.axvline(K_MAX_RERAND, color='gray', linestyle='-.', alpha=0.7, linewidth=1)
+ax.text(K_MAX_RERAND * 0.6, 0.3, '$k_{\\max}$', color='gray', fontsize=10, ha='right')
 
 ax.set_xlabel('Number of additional re-randomizations ($k$)')
 ax.set_ylabel('Max $|\\nu|$ per coefficient  ($\\times 10^8$)')
 ax.set_title('Noise Growth vs Re-randomizations (Fixed-Key)')
 ax.legend(loc='upper left', framealpha=0.9)
 ax.set_ylim(0, THRESHOLD / 1e8 * 1.15)
-ax.set_xlim(1, 2 * K_MAX)
+ax.set_xlim(1, 2 * K_MAX_RERAND)
 ax.grid(True, alpha=0.2, which='both')
 
 fig.tight_layout()
@@ -169,15 +173,18 @@ ax.semilogx(k_extrap, headroom_theory, 'r--', linewidth=1.2,
             label='Sub-Gaussian headroom (worst-case)')
 ax.axhline(1.0, color='red', linestyle=':', linewidth=1, alpha=0.7,
            label='Failure boundary')
-ax.axvline(K_MAX, color='gray', linestyle='-.', alpha=0.7, linewidth=1)
-ax.text(K_MAX * 0.6, 8, '$k_{\\max}$', color='gray', fontsize=10, ha='right')
+ax.axvline(K_MAX_RERAND, color='gray', linestyle='-.', alpha=0.7, linewidth=1)
+# Label placed in the clear band between the blue (empirical) and red (bound)
+# curves so it does not overlap either.
+ax.text(K_MAX_RERAND * 0.55, 12.5, '$k_{\\max}$', color='gray', fontsize=10,
+        ha='right')
 
 ax.set_xlabel('Number of additional re-randomizations ($k$)')
 ax.set_ylabel('Headroom ($q_2/2 \\;/\\; \\|\\nu\\|_\\infty$)')
 ax.set_title('Decryption Headroom vs Re-randomizations (Fixed-Key)')
 ax.legend(loc='upper right', framealpha=0.9)
 ax.set_ylim(0, 25)
-ax.set_xlim(1, 2 * K_MAX)
+ax.set_xlim(1, 2 * K_MAX_RERAND)
 ax.grid(True, alpha=0.2, which='both')
 
 fig.tight_layout()
