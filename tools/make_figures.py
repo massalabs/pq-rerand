@@ -155,7 +155,7 @@ ax.set_xlim(1, 2 * K_MAX_RERAND)
 ax.grid(True, alpha=0.2, which='both')
 
 fig.tight_layout()
-fig.savefig('paper/figures/Fig1.png', dpi=200)
+fig.savefig('paper/figures/Fig1.png', dpi=600)
 print("Saved paper/figures/Fig1.png  (noise growth)")
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -188,7 +188,7 @@ ax.set_xlim(1, 2 * K_MAX_RERAND)
 ax.grid(True, alpha=0.2, which='both')
 
 fig.tight_layout()
-fig.savefig('paper/figures/Fig2.png', dpi=200)
+fig.savefig('paper/figures/Fig2.png', dpi=600)
 print("Saved paper/figures/Fig2.png  (headroom)")
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -217,7 +217,7 @@ ax.set_title('Per-Coefficient Noise Distribution After 1,000 Re-randomizations')
 ax.legend(framealpha=0.9)
 
 fig.tight_layout()
-fig.savefig('paper/figures/Fig3.png', dpi=200)
+fig.savefig('paper/figures/Fig3.png', dpi=600)
 print("Saved paper/figures/Fig3.png  (noise histogram)")
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -243,7 +243,7 @@ if k_show in sim_per_key:
     ax.grid(True, alpha=0.2, axis='y')
 
 fig.tight_layout()
-fig.savefig('paper/figures/Fig4.png', dpi=200)
+fig.savefig('paper/figures/Fig4.png', dpi=600)
 print("Saved paper/figures/Fig4.png  (key variability)")
 
 print("\nDone. All figures in paper/figures/")
