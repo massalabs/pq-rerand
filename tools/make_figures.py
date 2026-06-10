@@ -3,7 +3,7 @@
 Generate publication-quality figures for the paper.
 Run from the pq-rerand/ directory: python3 tools/make_figures.py
 
-Fixed-key simulation: 20 keys x 10 trials per key, matching Theorem 4.6's
+Fixed-key simulation: 10 keys x 5 trials per key, matching Theorem 4.6's
 operational setting (key fixed, randomness over encryption/rerand only).
 """
 
