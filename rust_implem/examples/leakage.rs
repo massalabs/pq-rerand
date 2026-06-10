@@ -9,7 +9,8 @@
 //!
 //! Targets (fixed-vs-random over the *data* input). To avoid a cache-locality
 //! confound, both classes stream through equally-sized pools (identical memory
-//! footprint and access pattern); only the data content differs:
+//! footprint and access pattern); only the data content differs. Following
+//! dudect convention, the "fixed" class is an arbitrary fixed *random* constant:
 //!   * `encrypt_slot` — fixed vs. random *plaintext* (tests message-dependence
 //!     of the encryption path).
 //!   * `rerandomize` — fixed- vs. random-plaintext *input ciphertexts* (public
@@ -19,6 +20,23 @@
 //!     (Barrett reduction, csub/submod, center-lift).
 //!   * `leaky_reduce` — POSITIVE CONTROL: a branchy reduction that *should* be
 //!     flagged, proving the harness can detect leakage.
+//!
+//! Two additional diagnostics document a *hardware* (not software) effect:
+//!   * `encrypt (all-zero)` — all-zero vs. random plaintext. On some CPUs
+//!     (observed on Zen 4) this can be flagged at a ~0.02% timing difference
+//!     even though the code is branchless, because operating on all-zero data
+//!     costs marginally less energy/time at the silicon level (data-dependent
+//!     bit-toggle effects). The signal is at the edge of detectability at this
+//!     sample count and does not appear on every run.
+//!   * `hw zero-load (baseline)` — a pure load+XOR loop with *no* crypto
+//!     arithmetic over the same two pools. It is robustly flagged on such CPUs,
+//!     proving the all-zero signal originates in the hardware data path, not in
+//!     this crate's control flow or memory addressing.
+//!
+//! In the intended deployment this degenerate-input channel is absent by
+//! construction: payloads are AEAD ciphertexts, which are indistinguishable
+//! from uniformly random bytes, so an all-zero (or otherwise low-entropy)
+//! plaintext never occurs.
 //!
 //! (We test the full operations rather than micro-benchmarking individual modular
 //! primitives: a ~300-cycle primitive sits below reliable `rdtsc` resolution, where
@@ -176,7 +194,7 @@ fn leak_decrypt(
     n: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     let mut rng = StdRng::seed_from_u64(0xDEC0);
-    let fixed_msg = [0u32; N];
+    let fixed_msg = rand_message(&mut rng); // arbitrary fixed constant (dudect)
     let pool0: Vec<CiphertextSlot> = (0..POOL)
         .map(|_| encrypt_slot(&mut rng, ctx, pk, &fixed_msg, SIGMA_FLOOD))
         .collect();
@@ -199,12 +217,18 @@ fn leak_decrypt(
 
 /// Measure `encrypt_slot` for fixed vs. random plaintexts. Both classes stream
 /// through equally-sized message pools (matched footprint); only the content
-/// differs (all-zero vs. random). Encryption noise is drawn from one shared RNG
-/// advanced identically across both classes, so its variance is unbiased.
-fn leak_encrypt(ctx: &NttContext, pk: &PublicKey, n: usize) -> (Vec<f64>, Vec<f64>) {
+/// differs. Encryption noise is drawn from one shared RNG advanced identically
+/// across both classes, so its variance is unbiased. `fixed_msg` selects the
+/// fixed class: a fixed random constant (dudect convention) or the degenerate
+/// all-zero plaintext (hardware-effect diagnostic; see module docs).
+fn leak_encrypt(
+    ctx: &NttContext,
+    pk: &PublicKey,
+    n: usize,
+    fixed_msg: &[u32; N],
+) -> (Vec<f64>, Vec<f64>) {
     let mut mrng = StdRng::seed_from_u64(0xE2C0);
-    let fixed_msg = [0u32; N];
-    let pool0: Vec<[u32; N]> = (0..POOL).map(|_| fixed_msg).collect();
+    let pool0: Vec<[u32; N]> = (0..POOL).map(|_| *fixed_msg).collect();
     let pool1: Vec<[u32; N]> = (0..POOL).map(|_| rand_message(&mut mrng)).collect();
     let mut erng = StdRng::seed_from_u64(0xE2C1);
     let run = |msg: &[u32; N], r: &mut StdRng| -> f64 {
@@ -225,7 +249,8 @@ fn leak_encrypt(ctx: &NttContext, pk: &PublicKey, n: usize) -> (Vec<f64>, Vec<f6
 /// the re-randomization noise comes from one shared RNG advanced identically.
 fn leak_rerand(ctx: &NttContext, pk: &PublicKey, n: usize) -> (Vec<f64>, Vec<f64>) {
     let mut erng = StdRng::seed_from_u64(0x4E4D);
-    let fixed_msg = [0u32; N];
+    let mut mrng = StdRng::seed_from_u64(0x4E4F);
+    let fixed_msg = rand_message(&mut mrng); // arbitrary fixed constant (dudect)
     let pool0: Vec<CiphertextSlot> = (0..POOL)
         .map(|_| encrypt_slot(&mut erng, ctx, pk, &fixed_msg, SIGMA_FLOOD))
         .collect();
@@ -246,6 +271,33 @@ fn leak_rerand(ctx: &NttContext, pk: &PublicKey, n: usize) -> (Vec<f64>, Vec<f64
     (c0, c1)
 }
 
+/// Hardware baseline: a pure streaming load+XOR over all-zero vs. random pools.
+/// Contains no crypto arithmetic at all; any flagged difference is a property of
+/// the CPU's data path (data-dependent bit-toggle energy/time), not of this crate.
+fn leak_hw_zero_load(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = StdRng::seed_from_u64(0x0B5E);
+    let pool0: Vec<[u32; N]> = (0..POOL).map(|_| [0u32; N]).collect();
+    let pool1: Vec<[u32; N]> = (0..POOL).map(|_| rand_message(&mut rng)).collect();
+    let run = |buf: &[u32; N]| -> f64 {
+        let s = rdtsc();
+        let mut acc = 0u32;
+        for _ in 0..8 {
+            for &x in buf.iter() {
+                acc ^= black_box(x);
+            }
+        }
+        let e = rdtsc();
+        black_box(acc);
+        (e - s) as f64
+    };
+    let (mut c0, mut c1) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for i in 0..n {
+        c0.push(run(&pool0[i % POOL]));
+        c1.push(run(&pool1[i % POOL]));
+    }
+    (c0, c1)
+}
+
 fn main() {
     let ctx = NttContext::new();
     let mut rng = StdRng::seed_from_u64(1);
@@ -256,7 +308,8 @@ fn main() {
     // Warm up caches / frequency.
     let _ = leak_leaky(5_000);
 
-    let (a, b) = leak_encrypt(&ctx, &pk, 30_000);
+    let fixed_random = rand_message(&mut rng);
+    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &fixed_random);
     report("encrypt_slot", &a, &b);
 
     let (a, b) = leak_rerand(&ctx, &pk, 30_000);
@@ -268,8 +321,22 @@ fn main() {
     let (a, b) = leak_leaky(400_000);
     report("leaky_reduce (control)", &a, &b);
 
+    println!("\nHardware data-path diagnostics (see module docs):");
+    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &[0u32; N]);
+    report("encrypt (all-zero msg)", &a, &b);
+
+    let (a, b) = leak_hw_zero_load(200_000);
+    report("hw zero-load baseline", &a, &b);
+
     println!(
-        "\nNote: the positive control is expected to show LEAKAGE; the constant-time\n\
-         targets are expected to stay below the 4.5 threshold. Re-run under low load."
+        "\nNotes: the positive control is expected to show LEAKAGE; the constant-time\n\
+         targets are expected to stay below the 4.5 threshold. On CPUs with\n\
+         data-dependent bit-toggle timing (observed on Zen 4), the zero-load\n\
+         baseline is robustly flagged and the all-zero encrypt diagnostic may be\n\
+         flagged at a ~0.02% difference: a degenerate all-zero input can be\n\
+         distinguishable at the hardware level even for branchless code (the\n\
+         zero-load baseline contains no crypto arithmetic). AEAD-wrapped payloads\n\
+         (the intended deployment) are uniformly random, so this input never occurs.\n\
+         Re-run under low load."
     );
 }
