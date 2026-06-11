@@ -176,9 +176,9 @@ ax.semilogx(k_extrap, headroom_theory, 'r--', linewidth=1.2,
 ax.axhline(1.0, color='red', linestyle=':', linewidth=1, alpha=0.7,
            label='Failure boundary')
 ax.axvline(K_MAX_RERAND, color='gray', linestyle='-.', alpha=0.7, linewidth=1)
-# Label placed in the clear band between the blue (empirical) and red (bound)
-# curves so it does not overlap either.
-ax.text(K_MAX_RERAND * 0.55, 12.5, '$k_{\\max}$', color='gray', fontsize=10,
+# Label placed well above the descending empirical curve so it reads as
+# annotating the vertical k_max line, not the curve.
+ax.text(K_MAX_RERAND * 0.55, 16.5, '$k_{\\max}$', color='gray', fontsize=10,
         ha='right')
 
 ax.set_xlabel('Number of additional re-randomizations ($k$)')
