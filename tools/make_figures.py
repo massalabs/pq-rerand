@@ -144,12 +144,14 @@ ax.errorbar(k_pts, means / 1e8, yerr=stds / 1e8, fmt='ko', markersize=4,
             capsize=3, label=f'Fixed-key sim ({NUM_KEYS} keys, {NUM_TRIALS_PER_KEY} trials/key)', zorder=5)
 
 ax.axvline(K_MAX_RERAND, color='gray', linestyle='-.', alpha=0.7, linewidth=1)
-ax.text(K_MAX_RERAND * 0.6, 0.3, '$k_{\\max}$', color='gray', fontsize=10, ha='right')
+# Label in the empty band between the empirical (blue) and bound (red) curves.
+ax.text(K_MAX_RERAND * 0.6, 8.0, '$k_{\\max}$', color='gray', fontsize=10, ha='right')
 
 ax.set_xlabel('Number of additional re-randomizations ($k$)')
 ax.set_ylabel('Max $|\\nu|$ per coefficient  ($\\times 10^8$)')
 ax.set_title('Noise Growth vs Re-randomizations (Fixed-Key)')
-ax.legend(loc='upper left', framealpha=0.9)
+# Inset from the left edge so the threshold's y-axis intercept stays visible.
+ax.legend(loc='upper left', bbox_to_anchor=(0.10, 0.98), framealpha=0.9)
 ax.set_ylim(0, THRESHOLD / 1e8 * 1.15)
 ax.set_xlim(1, 2 * K_MAX_RERAND)
 ax.grid(True, alpha=0.2, which='both')
@@ -174,15 +176,17 @@ ax.semilogx(k_extrap, headroom_theory, 'r--', linewidth=1.2,
 ax.axhline(1.0, color='red', linestyle=':', linewidth=1, alpha=0.7,
            label='Failure boundary')
 ax.axvline(K_MAX_RERAND, color='gray', linestyle='-.', alpha=0.7, linewidth=1)
-# Label placed in the clear band between the blue (empirical) and red (bound)
-# curves so it does not overlap either.
-ax.text(K_MAX_RERAND * 0.55, 12.5, '$k_{\\max}$', color='gray', fontsize=10,
+# Label placed well above the descending empirical curve so it reads as
+# annotating the vertical k_max line, not the curve.
+ax.text(K_MAX_RERAND * 0.55, 16.5, '$k_{\\max}$', color='gray', fontsize=10,
         ha='right')
 
 ax.set_xlabel('Number of additional re-randomizations ($k$)')
 ax.set_ylabel('Headroom ($q_2/2 \\;/\\; \\|\\nu\\|_\\infty$)')
 ax.set_title('Decryption Headroom vs Re-randomizations (Fixed-Key)')
-ax.legend(loc='upper right', framealpha=0.9)
+# Mid-left placement: sits in the empty band between the two flat curves,
+# keeping both left intercepts and the right-hand decline visible.
+ax.legend(loc='center left', bbox_to_anchor=(0.04, 0.55), framealpha=0.9)
 ax.set_ylim(0, 25)
 ax.set_xlim(1, 2 * K_MAX_RERAND)
 ax.grid(True, alpha=0.2, which='both')
@@ -215,6 +219,7 @@ ax.set_xlabel('Noise value ($\\times 10^6$)')
 ax.set_ylabel('Density')
 ax.set_title('Per-Coefficient Noise Distribution After 1,000 Re-randomizations')
 ax.legend(framealpha=0.9)
+ax.grid(True, alpha=0.2)
 
 fig.tight_layout()
 fig.savefig('paper/figures/Fig3.png', dpi=600)
