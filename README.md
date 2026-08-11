@@ -2,6 +2,10 @@
 
 An efficient, large-block, post-quantum publicly re-randomizable encryption scheme based on Ring-LWE.
 
+This repository is the reference implementation of the scheme published in the *Journal of Cryptographic Engineering*:
+
+> Vodenicarevic, D., Fleiser, A., Seznec, P. et al. **Two-limb CRT Ring-LWE encryption with exact decryption and public re-randomization.** *J Cryptogr Eng* 16, 13 (2026). [https://link.springer.com/article/10.1007/s13389-026-00401-2](https://link.springer.com/article/10.1007/s13389-026-00401-2)
+
 **Public re-randomization** allows anyone holding the public key to transform a ciphertext into a fresh-looking encryption of the same plaintext — without learning anything about the plaintext and without increasing the ciphertext size. The original and re-randomized ciphertexts are computationally unlinkable under the Decision Ring-LWE assumption.
 
 ## Why this scheme?
@@ -148,3 +152,26 @@ sage tools/lattice_estimate_sage.py
 2. **Encrypt**: sample randomness `(r, e₁, e₂)`, compute `c₁ = a·r + e₁` and `c₀ = b·r + e₂ + Δ_t·M` (t-limb) / `c₀ = b·r + e₂` (q₂-limb). Optionally add a one-time flooding encryption of zero.
 3. **ReRand**: sample fresh `(r', e₁', e₂')` and add `Enc(pk, 0)` to the ciphertext.
 4. **Decrypt**: compute `v = c₀ - c₁·s` in each limb. The q₂-limb `v_{q₂}` is pure noise (since `Δ·M ≡ 0 mod q₂`). Center-lift to recover the signed noise `ν`, then recover `M = (v_t - ν) · Δ_t⁻¹ mod t`.
+
+## Citing this work
+
+The scheme, its security analysis, and the parameter selection are described in the peer-reviewed article, published in the *Journal of Cryptographic Engineering* (Springer): [https://link.springer.com/article/10.1007/s13389-026-00401-2](https://link.springer.com/article/10.1007/s13389-026-00401-2) (DOI: [10.1007/s13389-026-00401-2](https://doi.org/10.1007/s13389-026-00401-2)).
+
+If you use this work, please cite:
+
+```bibtex
+@article{vodenicarevic2026pqrerand,
+  author  = {Vodenicarevic, Damir and Fleiser, Andrei and Seznec, Pierre and
+             Mayen Naranjo, Karen and Foucher, Lucas and Besan{\c{c}}on, L{\'e}o and
+             Alabarbe, Thybault and Morcillo, Jean-Fran{\c{c}}ois and
+             Reynes, Benjamin and Urvoy, Lilian},
+  title   = {Two-limb {CRT} {Ring-LWE} encryption with exact decryption and
+             public re-randomization},
+  journal = {Journal of Cryptographic Engineering},
+  volume  = {16},
+  pages   = {13},
+  year    = {2026},
+  doi     = {10.1007/s13389-026-00401-2},
+  url     = {https://link.springer.com/article/10.1007/s13389-026-00401-2}
+}
+```
