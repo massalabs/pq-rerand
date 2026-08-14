@@ -12,6 +12,7 @@
 # Allow top-level files
 !.gitignore
 !README.md
+!LICENSE
 
 # Rust build artifacts
 rust_implem/target/

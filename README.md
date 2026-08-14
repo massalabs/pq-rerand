@@ -117,6 +117,7 @@ pq-rerand/
 │   ├── make_figures.py        # Generate publication figures (requires numpy, matplotlib, scipy)
 │   ├── security_estimate.py   # HE Standard v1.1 security cross-check (pure Python)
 │   └── lattice_estimate_sage.py  # Lattice-estimator script (requires SageMath)
+├── LICENSE                    # MIT
 └── README.md
 ```
 
@@ -175,3 +176,8 @@ If you use this work, please cite:
   url     = {https://link.springer.com/article/10.1007/s13389-026-00401-2}
 }
 ```
+
+## License
+
+This repository is released under the [MIT License](LICENSE).
+
