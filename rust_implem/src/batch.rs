@@ -11,6 +11,7 @@ use crate::params::N;
 use crate::poly::NttContext;
 use crate::keygen::{PublicKey, SecretKey};
 use crate::encrypt::{encrypt_slot, CiphertextSlot};
+use crate::sampling::FloodSampler;
 use crate::rerandomize::rerandomize_slot;
 use crate::decrypt::decrypt_slot;
 use rand::SeedableRng;
@@ -47,12 +48,13 @@ fn slot_seed(base_seed: &[u8; 32], i: usize) -> [u8; 32] {
 
 /// Encrypt a batch of message polynomials in parallel.
 ///
+/// `flood` selects the flood packet (see [`crate::encrypt::encrypt_slot`]);
 /// `base_seed` must be a fresh, uniformly random 256-bit value.
 pub fn encrypt_batch(
     ctx: &NttContext,
     pk: &PublicKey,
     messages: &[[u32; N]],
-    sigma_flood: f64,
+    flood: FloodSampler,
     base_seed: &[u8; 32],
 ) -> Vec<CiphertextSlot> {
     ensure_pool();
@@ -61,7 +63,7 @@ pub fn encrypt_batch(
         .enumerate()
         .map(|(i, m)| {
             let mut rng = StdRng::from_seed(slot_seed(base_seed, i));
-            encrypt_slot(&mut rng, ctx, pk, m, sigma_flood)
+            encrypt_slot(&mut rng, ctx, pk, m, flood)
         })
         .collect()
 }
@@ -98,7 +100,6 @@ pub fn decrypt_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::SIGMA_FLOOD;
     use crate::keygen::keygen;
 
     #[test]
@@ -117,10 +118,12 @@ mod tests {
             })
             .collect();
 
-        let cts = encrypt_batch(&ctx, &pk, &messages, SIGMA_FLOOD, &[42u8; 32]);
-        let cts2 = rerandomize_batch(&ctx, &pk, &cts, &[43u8; 32]);
-        let recovered = decrypt_batch(&ctx, &sk, &cts2);
-        assert_eq!(messages, recovered, "parallel batch roundtrip failed");
+        for flood in [FloodSampler::INVERSE_CDF, FloodSampler::KARNEY, FloodSampler::None] {
+            let cts = encrypt_batch(&ctx, &pk, &messages, flood, &[42u8; 32]);
+            let cts2 = rerandomize_batch(&ctx, &pk, &cts, &[43u8; 32]);
+            let recovered = decrypt_batch(&ctx, &sk, &cts2);
+            assert_eq!(messages, recovered, "parallel batch roundtrip failed ({flood:?})");
+        }
     }
 
     #[test]

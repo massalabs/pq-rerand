@@ -4,7 +4,7 @@ use crate::params::{N, T, Q2, DELTA_T};
 use crate::ntt::{pointwise_add, pointwise_mul, barrett_mu, barrett_reduce, addmod};
 use crate::poly::{Poly, NttContext};
 use crate::keygen::PublicKey;
-use crate::sampling::{sample_gaussian, sample_gaussian_cdt};
+use crate::sampling::{sample_gaussian_cdt, FloodSampler};
 use rand::{CryptoRng, Rng};
 use zeroize::Zeroize;
 
@@ -24,6 +24,11 @@ pub struct CiphertextSlot {
 /// Encrypt a single message polynomial M (coefficients in [0, 2^31 - 1]).
 /// Performs base encryption + noise-flooding smudge.
 ///
+/// `flood` selects the flood packet's width and sampler
+/// ([`FloodSampler::INVERSE_CDF`] is the published configuration,
+/// [`FloodSampler::KARNEY`] the exact discrete Gaussian at the same width,
+/// [`FloodSampler::None`] no flooding).
+///
 /// The RNG must be cryptographically secure (enforced via the [`CryptoRng`]
 /// marker bound). Transient encryption randomness is zeroized before returning.
 pub fn encrypt_slot<R: Rng + CryptoRng>(
@@ -31,7 +36,7 @@ pub fn encrypt_slot<R: Rng + CryptoRng>(
     ctx: &NttContext,
     pk: &PublicKey,
     message: &[u32; N],
-    sigma_flood: f64,
+    flood: FloodSampler,
 ) -> CiphertextSlot {
     // Sample base-width noise (constant-time CDT) and flood-width noise, then add
     // them coefficient-wise. The base encryption and the flooding Enc(0) are both
@@ -45,9 +50,9 @@ pub fn encrypt_slot<R: Rng + CryptoRng>(
     let mut r_b = sample_gaussian_cdt(rng);
     let mut e1_b = sample_gaussian_cdt(rng);
     let mut e2_b = sample_gaussian_cdt(rng);
-    let mut r_f = sample_gaussian(rng, sigma_flood);
-    let mut e1_f = sample_gaussian(rng, sigma_flood);
-    let mut e2_f = sample_gaussian(rng, sigma_flood);
+    let mut r_f = flood.sample(rng);
+    let mut e1_f = flood.sample(rng);
+    let mut e2_f = flood.sample(rng);
 
     let mut r_int = [0i64; N];
     let mut e1_int = [0i64; N];

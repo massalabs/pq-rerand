@@ -8,7 +8,8 @@
 //! Reports median wall-clock timings for single-slot and 1024-slot batch
 //! operations, both single-threaded and multi-threaded (rayon).
 
-use pq_rerand::params::{N, NUM_SLOTS, SIGMA_FLOOD, BITS_PER_COEFF};
+use pq_rerand::params::{N, NUM_SLOTS, BITS_PER_COEFF};
+use pq_rerand::sampling::FloodSampler;
 use pq_rerand::poly::NttContext;
 use pq_rerand::keygen::keygen;
 use pq_rerand::encrypt::encrypt_slot;
@@ -54,15 +55,26 @@ fn main() {
     let messages: Vec<[u32; N]> = vec![message; NUM_SLOTS];
 
     // Warm up (caches, rayon pool spin-up).
-    let ct0 = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct0 = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let _ = decrypt_slot(&ctx, &sk, &ct0);
-    let _ = encrypt_batch(&ctx, &pk, &messages, SIGMA_FLOOD, &[1u8; 32]);
+    let _ = encrypt_batch(&ctx, &pk, &messages, FloodSampler::INVERSE_CDF, &[1u8; 32]);
 
     // ---- Single-slot ----
     let enc = time_n(200, || {
-        let _ = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+        let _ = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     });
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let enc_karney = time_n(200, || {
+        let _ = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::KARNEY);
+    });
+    // Flood samplers alone (one polynomial of N coefficients).
+    let smp_icdf = time_n(400, || {
+        let _ = pq_rerand::sampling::sample_gaussian(&mut rng, pq_rerand::params::SIGMA_FLOOD);
+    });
+    let karney = pq_rerand::sampling::KarneyParams::FLOOD;
+    let smp_karney = time_n(400, || {
+        let _ = pq_rerand::sampling::sample_gaussian_karney(&mut rng, &karney);
+    });
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let rer = time_n(400, || {
         let _ = rerandomize_slot(&mut rng, &ctx, &pk, &ct);
     });
@@ -74,9 +86,9 @@ fn main() {
     let enc_seq = time_n(7, || {
         let mut r = StdRng::seed_from_u64(7);
         let _: Vec<_> = messages.iter()
-            .map(|m| encrypt_slot(&mut r, &ctx, &pk, m, SIGMA_FLOOD)).collect();
+            .map(|m| encrypt_slot(&mut r, &ctx, &pk, m, FloodSampler::INVERSE_CDF)).collect();
     });
-    let cts = encrypt_batch(&ctx, &pk, &messages, SIGMA_FLOOD, &[9u8; 32]);
+    let cts = encrypt_batch(&ctx, &pk, &messages, FloodSampler::INVERSE_CDF, &[9u8; 32]);
     let rer_seq = time_n(7, || {
         let mut r = StdRng::seed_from_u64(7);
         let _: Vec<_> = cts.iter()
@@ -88,7 +100,10 @@ fn main() {
 
     // ---- Batch (B = 1024), multi-threaded (rayon) ----
     let enc_par = time_n(7, || {
-        let _ = encrypt_batch(&ctx, &pk, &messages, SIGMA_FLOOD, &[9u8; 32]);
+        let _ = encrypt_batch(&ctx, &pk, &messages, FloodSampler::INVERSE_CDF, &[9u8; 32]);
+    });
+    let enc_par_karney = time_n(7, || {
+        let _ = encrypt_batch(&ctx, &pk, &messages, FloodSampler::KARNEY, &[9u8; 32]);
     });
     let rer_par = time_n(7, || {
         let _ = rerandomize_batch(&ctx, &pk, &cts, &[11u8; 32]);
@@ -99,8 +114,13 @@ fn main() {
 
     println!("threads (rayon)        : {threads}");
     println!();
+    println!("=== Flood sampler, one polynomial of {N} coefficients (median) ===");
+    println!("  inverse-CDF (CT)     : {:.3} ms  ({:.0} ns/coeff)", ms(smp_icdf), ms(smp_icdf) * 1e6 / N as f64);
+    println!("  Karney exact         : {:.3} ms  ({:.0} ns/coeff)", ms(smp_karney), ms(smp_karney) * 1e6 / N as f64);
+    println!();
     println!("=== Single ciphertext (median) ===");
     println!("  encrypt (base+flood) : {:.3} ms", ms(enc));
+    println!("  encrypt (Karney flood): {:.3} ms", ms(enc_karney));
     println!("  re-randomize         : {:.3} ms", ms(rer));
     println!("  decrypt              : {:.3} ms", ms(dec));
     println!();
@@ -111,6 +131,7 @@ fn main() {
     println!();
     println!("=== Batch B=1024, multi-threaded rayon ({threads} threads, median) ===");
     println!("  encrypt              : {:.3} s  ({:.3} ms/ct)", enc_par.as_secs_f64(), ms(enc_par) / NUM_SLOTS as f64);
+    println!("  encrypt (Karney)     : {:.3} s  ({:.3} ms/ct)", enc_par_karney.as_secs_f64(), ms(enc_par_karney) / NUM_SLOTS as f64);
     println!("  re-randomize         : {:.3} s  ({:.3} ms/ct)", rer_par.as_secs_f64(), ms(rer_par) / NUM_SLOTS as f64);
     println!("  decrypt              : {:.3} s  ({:.3} ms/ct)", dec_par.as_secs_f64(), ms(dec_par) / NUM_SLOTS as f64);
 }

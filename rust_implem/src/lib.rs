@@ -8,8 +8,15 @@
 //! * The base-width Gaussian sampler (keygen / base encryption /
 //!   re-randomization) is a constant-time CDT sampler
 //!   ([`sampling::sample_gaussian_cdt`]).
-//! * The flood-width sampler is a branchless constant-time inverse-CDF sampler
-//!   ([`sampling::sample_gaussian`]).
+//! * The flood-width sampler is selected per encryption with
+//!   [`sampling::FloodSampler`]: by default a branchless constant-time
+//!   inverse-CDF sampler ([`sampling::sample_gaussian`]); alternatively an
+//!   **exact** discrete-Gaussian sampler ([`sampling::sample_gaussian_karney`],
+//!   Karney's algorithm), which is variable-time. The flood packet is an
+//!   encryption of zero, i.e. public-domain randomness: a timing leak of its
+//!   value would reduce the ciphertext to the base encryption, itself a secure
+//!   Ring-LWE encryption, so the exact sampler's timing carries no secret. Use
+//!   it where a proof needs the flood distribution to be exactly `D_{Z,σ}`.
 //! * The NTT / modular-arithmetic layer — including the secret-dependent
 //!   decryption path (center-lift and final reduction) — is branchless and
 //!   division-free by construction: control flow and memory-access patterns are

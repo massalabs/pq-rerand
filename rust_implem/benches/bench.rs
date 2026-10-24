@@ -5,6 +5,7 @@ use pq_rerand::keygen::keygen;
 use pq_rerand::encrypt::encrypt_slot;
 use pq_rerand::decrypt::decrypt_slot;
 use pq_rerand::rerandomize::rerandomize_slot;
+use pq_rerand::sampling::{sample_gaussian, sample_gaussian_karney, FloodSampler, KarneyParams};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::time::Duration;
@@ -19,15 +20,34 @@ fn bench_single_slot(c: &mut Criterion) {
         *c = (i as u32) % (1 << BITS_PER_COEFF);
     }
 
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
 
     c.bench_function("keygen", |b| {
         b.iter(|| keygen(&mut rng, &ctx))
     });
 
+    // The two flood samplers alone, one polynomial (N = 4096 coefficients)
+    // each, next to the base-width CDT sampler for scale.
+    c.bench_function("flood sampler: inverse-CDF (4096 coeffs)", |b| {
+        b.iter(|| sample_gaussian(&mut rng, black_box(SIGMA_FLOOD)))
+    });
+    let karney = KarneyParams::FLOOD;
+    c.bench_function("flood sampler: Karney exact (4096 coeffs)", |b| {
+        b.iter(|| sample_gaussian_karney(&mut rng, black_box(&karney)))
+    });
+    c.bench_function("base sampler: CDT (4096 coeffs)", |b| {
+        b.iter(|| pq_rerand::sampling::sample_gaussian_cdt(&mut rng))
+    });
+
     c.bench_function("encrypt_slot (base+smudge)", |b| {
         b.iter(|| {
-            encrypt_slot(&mut rng, &ctx, &pk, black_box(&message), SIGMA_FLOOD)
+            encrypt_slot(&mut rng, &ctx, &pk, black_box(&message), FloodSampler::INVERSE_CDF)
+        })
+    });
+
+    c.bench_function("encrypt_slot (base+Karney smudge)", |b| {
+        b.iter(|| {
+            encrypt_slot(&mut rng, &ctx, &pk, black_box(&message), FloodSampler::KARNEY)
         })
     });
 
@@ -52,7 +72,7 @@ fn bench_full_message(c: &mut Criterion) {
     let mut message = [0u32; N];
     for (i, c) in message.iter_mut().enumerate() { *c = (i as u32) % (1 << BITS_PER_COEFF); }
     let slots: Vec<_> = (0..NUM_SLOTS)
-        .map(|_| encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD))
+        .map(|_| encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF))
         .collect();
 
     // Heavy 15.5 MiB batch ops (single-threaded); fewer samples to keep wall-clock
