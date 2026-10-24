@@ -1,9 +1,9 @@
 [package]
 name = "pq-rerand"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.74"
-description = "Post-quantum publicly re-randomizable encryption (BFV/LPR + CRT noise-limb trick). Constant-time by construction; not yet externally audited."
+description = "Post-quantum publicly re-randomizable encryption (BFV/LPR + CRT noise-limb trick). Constant-time by construction, with an optional exact discrete-Gaussian flood sampler; not yet externally audited."
 license = "MIT"
 repository = "https://github.com/massalabs/pq-rerand"
 keywords = ["post-quantum", "ring-lwe", "re-randomization", "encryption"]

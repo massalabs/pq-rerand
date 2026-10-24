@@ -12,7 +12,9 @@
 //! footprint and access pattern); only the data content differs. Following
 //! dudect convention, the "fixed" class is an arbitrary fixed *random* constant:
 //!   * `encrypt_slot` — fixed vs. random *plaintext* (tests message-dependence
-//!     of the encryption path).
+//!     of the encryption path), with the constant-time flood sampler and with
+//!     the exact (variable-time) Karney flood sampler: the latter's timing
+//!     varies with its own random digits, not with the plaintext.
 //!   * `rerandomize` — fixed- vs. random-plaintext *input ciphertexts* (public
 //!     path; tests operand-dependence).
 //!   * `decrypt_slot` — fixed- vs. random-plaintext ciphertexts; the
@@ -45,7 +47,8 @@
 //! Run with: `cargo run --release --example leakage`
 //! Results are statistical and machine-dependent; run multiple times under low load.
 
-use pq_rerand::params::{N, T, SIGMA_FLOOD, BITS_PER_COEFF};
+use pq_rerand::params::{N, T, BITS_PER_COEFF};
+use pq_rerand::sampling::FloodSampler;
 use pq_rerand::poly::NttContext;
 use pq_rerand::keygen::{keygen, SecretKey, PublicKey};
 use pq_rerand::encrypt::{encrypt_slot, CiphertextSlot};
@@ -196,10 +199,10 @@ fn leak_decrypt(
     let mut rng = StdRng::seed_from_u64(0xDEC0);
     let fixed_msg = rand_message(&mut rng); // arbitrary fixed constant (dudect)
     let pool0: Vec<CiphertextSlot> = (0..POOL)
-        .map(|_| encrypt_slot(&mut rng, ctx, pk, &fixed_msg, SIGMA_FLOOD))
+        .map(|_| encrypt_slot(&mut rng, ctx, pk, &fixed_msg, FloodSampler::INVERSE_CDF))
         .collect();
     let pool1: Vec<CiphertextSlot> = (0..POOL)
-        .map(|_| { let m = rand_message(&mut rng); encrypt_slot(&mut rng, ctx, pk, &m, SIGMA_FLOOD) })
+        .map(|_| { let m = rand_message(&mut rng); encrypt_slot(&mut rng, ctx, pk, &m, FloodSampler::INVERSE_CDF) })
         .collect();
     let run = |ct: &CiphertextSlot| -> f64 {
         let s = rdtsc();
@@ -226,6 +229,7 @@ fn leak_encrypt(
     pk: &PublicKey,
     n: usize,
     fixed_msg: &[u32; N],
+    flood: FloodSampler,
 ) -> (Vec<f64>, Vec<f64>) {
     let mut mrng = StdRng::seed_from_u64(0xE2C0);
     let pool0: Vec<[u32; N]> = (0..POOL).map(|_| *fixed_msg).collect();
@@ -233,7 +237,7 @@ fn leak_encrypt(
     let mut erng = StdRng::seed_from_u64(0xE2C1);
     let run = |msg: &[u32; N], r: &mut StdRng| -> f64 {
         let s = rdtsc();
-        black_box(encrypt_slot(r, ctx, pk, black_box(msg), SIGMA_FLOOD));
+        black_box(encrypt_slot(r, ctx, pk, black_box(msg), flood));
         (rdtsc() - s) as f64
     };
     let (mut c0, mut c1) = (Vec::with_capacity(n), Vec::with_capacity(n));
@@ -252,10 +256,10 @@ fn leak_rerand(ctx: &NttContext, pk: &PublicKey, n: usize) -> (Vec<f64>, Vec<f64
     let mut mrng = StdRng::seed_from_u64(0x4E4F);
     let fixed_msg = rand_message(&mut mrng); // arbitrary fixed constant (dudect)
     let pool0: Vec<CiphertextSlot> = (0..POOL)
-        .map(|_| encrypt_slot(&mut erng, ctx, pk, &fixed_msg, SIGMA_FLOOD))
+        .map(|_| encrypt_slot(&mut erng, ctx, pk, &fixed_msg, FloodSampler::INVERSE_CDF))
         .collect();
     let pool1: Vec<CiphertextSlot> = (0..POOL)
-        .map(|_| { let m = rand_message(&mut erng); encrypt_slot(&mut erng, ctx, pk, &m, SIGMA_FLOOD) })
+        .map(|_| { let m = rand_message(&mut erng); encrypt_slot(&mut erng, ctx, pk, &m, FloodSampler::INVERSE_CDF) })
         .collect();
     let mut rrng = StdRng::seed_from_u64(0x4E4E);
     let run = |ct: &CiphertextSlot, r: &mut StdRng| -> f64 {
@@ -309,8 +313,15 @@ fn main() {
     let _ = leak_leaky(5_000);
 
     let fixed_random = rand_message(&mut rng);
-    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &fixed_random);
+    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &fixed_random, FloodSampler::INVERSE_CDF);
     report("encrypt_slot", &a, &b);
+
+    // The exact (Karney) flood sampler is variable-time by construction, but its
+    // running time depends on the sampler's own random digits only, never on
+    // the plaintext: the fixed-vs-random test must still pass (with a larger
+    // per-call variance).
+    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &fixed_random, FloodSampler::KARNEY);
+    report("encrypt_slot (Karney flood)", &a, &b);
 
     let (a, b) = leak_rerand(&ctx, &pk, 30_000);
     report("rerandomize", &a, &b);
@@ -322,7 +333,7 @@ fn main() {
     report("leaky_reduce (control)", &a, &b);
 
     println!("\nHardware data-path diagnostics (see module docs):");
-    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &[0u32; N]);
+    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &[0u32; N], FloodSampler::INVERSE_CDF);
     report("encrypt (all-zero msg)", &a, &b);
 
     let (a, b) = leak_hw_zero_load(200_000);

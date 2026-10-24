@@ -7,6 +7,7 @@ use pq_rerand::encrypt::encrypt_slot;
 use pq_rerand::decrypt::decrypt_slot;
 use pq_rerand::rerandomize::rerandomize_slot;
 use pq_rerand::encoding::{encode, decode};
+use pq_rerand::sampling::FloodSampler;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -21,7 +22,7 @@ fn setup() -> (pq_rerand::keygen::SecretKey, pq_rerand::keygen::PublicKey, NttCo
 fn test_encrypt_decrypt_zeros() {
     let (sk, pk, ctx, mut rng) = setup();
     let message = [0u32; N];
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let recovered = decrypt_slot(&ctx, &sk, &ct);
     assert_eq!(message, recovered, "decrypt of zeros failed");
 }
@@ -30,7 +31,7 @@ fn test_encrypt_decrypt_zeros() {
 fn test_encrypt_decrypt_ones() {
     let (sk, pk, ctx, mut rng) = setup();
     let message = [1u32; N];
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let recovered = decrypt_slot(&ctx, &sk, &ct);
     assert_eq!(message, recovered, "decrypt of ones failed");
 }
@@ -43,7 +44,7 @@ fn test_encrypt_decrypt_random() {
     for c in message.iter_mut() {
         *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
     }
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let recovered = decrypt_slot(&ctx, &sk, &ct);
     assert_eq!(message, recovered, "decrypt of random message failed");
 }
@@ -53,7 +54,7 @@ fn test_encrypt_decrypt_max_values() {
     let (sk, pk, ctx, mut rng) = setup();
     // Max 31-bit value
     let message = [(1u32 << BITS_PER_COEFF) - 1; N];
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let recovered = decrypt_slot(&ctx, &sk, &ct);
     assert_eq!(message, recovered, "decrypt of max values failed");
 }
@@ -65,7 +66,7 @@ fn test_rerand_preserves_plaintext() {
     for c in message.iter_mut() {
         *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
     }
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let ct2 = rerandomize_slot(&mut rng, &ctx, &pk, &ct);
     let recovered = decrypt_slot(&ctx, &sk, &ct2);
     assert_eq!(message, recovered, "rerand broke plaintext");
@@ -78,7 +79,7 @@ fn test_multiple_rerands() {
     for c in message.iter_mut() {
         *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
     }
-    let mut ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let mut ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     // Apply 100 re-randomizations
     for _ in 0..100 {
         ct = rerandomize_slot(&mut rng, &ctx, &pk, &ct);
@@ -89,16 +90,42 @@ fn test_multiple_rerands() {
 
 #[test]
 fn test_encrypt_decrypt_no_flood() {
-    // Flooding is optional (paper §6): σ_f = 0 disables it entirely.
+    // Flooding is optional (paper §6): `FloodSampler::None` disables it entirely.
     let (sk, pk, ctx, mut rng) = setup();
     let mut message = [0u32; N];
     for c in message.iter_mut() {
         *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
     }
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, 0.0);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::None);
     let ct2 = rerandomize_slot(&mut rng, &ctx, &pk, &ct);
     let recovered = decrypt_slot(&ctx, &sk, &ct2);
     assert_eq!(message, recovered, "no-flood roundtrip failed");
+}
+
+#[test]
+fn test_encrypt_decrypt_karney_flood() {
+    // The exact discrete-Gaussian flood sampler: same width, same roundtrip
+    // and re-randomization behaviour as the inverse-CDF sampler.
+    let (sk, pk, ctx, mut rng) = setup();
+    let mut message = [0u32; N];
+    for c in message.iter_mut() {
+        *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
+    }
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::KARNEY);
+    assert_eq!(message, decrypt_slot(&ctx, &sk, &ct), "Karney-flood roundtrip failed");
+    let mut ct2 = ct.clone();
+    for _ in 0..20 {
+        ct2 = rerandomize_slot(&mut rng, &ctx, &pk, &ct2);
+    }
+    assert_eq!(message, decrypt_slot(&ctx, &sk, &ct2), "Karney-flood rerand roundtrip failed");
+}
+
+#[test]
+fn test_flood_samplers_agree_on_width() {
+    assert_eq!(FloodSampler::INVERSE_CDF.sigma(), SIGMA_FLOOD);
+    assert_eq!(FloodSampler::KARNEY.sigma(), SIGMA_FLOOD);
+    assert_eq!(FloodSampler::None.sigma(), 0.0);
+    assert_eq!(FloodSampler::default(), FloodSampler::INVERSE_CDF);
 }
 
 #[test]
@@ -109,7 +136,7 @@ fn test_serialization_roundtrip_via_crypto() {
     for c in message.iter_mut() {
         *c = rand::Rng::gen_range(&mut rng, 0..(1u32 << BITS_PER_COEFF));
     }
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let ct2 = deserialize_slot(&serialize_slot(&ct)).expect("valid ciphertext rejected");
     let recovered = decrypt_slot(&ctx, &sk, &ct2);
     assert_eq!(message, recovered, "serialize→deserialize→decrypt failed");
@@ -139,7 +166,7 @@ fn test_encoding_roundtrip_via_crypto() {
         *b = rand::Rng::gen(&mut rng);
     }
     let message = encode(&data);
-    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, SIGMA_FLOOD);
+    let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
     let ct2 = rerandomize_slot(&mut rng, &ctx, &pk, &ct);
     let recovered = decrypt_slot(&ctx, &sk, &ct2);
     let decoded = decode(&recovered);

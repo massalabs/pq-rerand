@@ -25,10 +25,10 @@ This construction is engineered around a **two-limb CRT modulus** `q = t · q₂
 **This implementation has not yet been externally audited.** It is written to production-quality standards and is intended to be audit-ready:
 
 - The base-width Gaussian sampler (keygen, base encryption, re-randomization) is a **constant-time CDT** discrete-Gaussian sampler (fixed-length branchless table scan).
-- The flood-width sampler is a **branchless constant-time inverse-CDF** sampler (no rejection loop, no data-dependent branch or table indexing).
+- The flood-width sampler is chosen per encryption (`FloodSampler`). The default is a **branchless constant-time inverse-CDF** sampler (no rejection loop, no data-dependent branch or table indexing); its output is a rounded continuous Gaussian up to the probit approximation's relative error (`< 1.15e-9`). The alternative, `FloodSampler::KARNEY`, is an **exact discrete-Gaussian sampler** (`D_{Z,σ}`, Karney's algorithm, integer arithmetic only): it is a rejection sampler and therefore variable-time, which is acceptable for the flood packet because that packet is public-domain randomness, an encryption of zero (learning it would reduce the ciphertext to the base encryption, itself a secure Ring-LWE encryption). Choose it when a security argument needs the flood distribution to be exactly specified, e.g. the statistical flooding lemmas of deniable-storage applications. See "Choosing the flood sampler" below.
 - The NTT / modular-arithmetic layer — including the secret-dependent decryption path (center-lift and final reduction) — is **branchless and division-free by construction**: control flow and memory-access patterns are independent of operand values.
 - All RNG inputs are bounded by `rand::CryptoRng`, enforcing a CSPRNG at the type level. Secret keys are zeroized on drop; transient secrets are zeroized best-effort. The library is `#![forbid(unsafe_code)]`.
-- A TVLA/dudect-style fixed-vs-random timing-leakage harness (`cargo run --release --example leakage`) reports no measurable leakage (Welch |t| < 4.5) on the encryption, re-randomization and decryption paths, while flagging a deliberately variable-time control (|t| > 3000). The harness also includes a hardware diagnostic: on CPUs with data-dependent bit-toggle timing (observed on Zen 4), *all-zero* vs random data content is distinguishable at the ~0.02% level even for a pure load loop with no crypto arithmetic; AEAD-wrapped payloads (the intended deployment) are uniformly random, so such degenerate inputs cannot occur.
+- A TVLA/dudect-style fixed-vs-random timing-leakage harness (`cargo run --release --example leakage`) reports no measurable leakage (Welch |t| < 4.5) on the encryption, re-randomization and decryption paths, while flagging a deliberately variable-time control (|t| > 3000). The harness also runs encryption with the exact Karney flood sampler: its running time varies with the sampler's own random digits but not with the plaintext (|t| ≈ 0.5, fixed vs. random messages). The harness also includes a hardware diagnostic: on CPUs with data-dependent bit-toggle timing (observed on Zen 4), *all-zero* vs random data content is distinguishable at the ~0.02% level even for a pure load loop with no crypto arithmetic; AEAD-wrapped payloads (the intended deployment) are uniformly random, so such degenerate inputs cannot occur.
 
 Branchless source plus one leakage run is not a substitute for microarchitectural verification: production deployments should repeat the timing-leakage assessment on their target platform (desktop and mobile) and an external audit is recommended before production use.
 
@@ -41,7 +41,7 @@ Branchless source plus one leakage run is not a substitute for microarchitectura
 | q₂ | 4,294,828,033 | Noise-limb modulus, prime ≈ 2³², q₂ ≡ 1 (mod 2n) |
 | q = t·q₂ | ≈ 2⁶³ | Combined modulus (never materialized on the hot path) |
 | σ | 3.2 | Narrow discrete Gaussian width |
-| σ_flood | ≈ 93,733 | Optional flooding Gaussian width (σ·√κ_f) |
+| σ_flood | 93,733.236 = 93,733,236 / 1000 | Optional flooding Gaussian width (σ·√κ_f); the exact sampler takes it as this fraction |
 | Plaintext/slot | 15,872 bytes (≈ 15.5 KiB) | 4096 coefficients × 31 bits |
 | Ciphertext/slot | 65,536 bytes (64 KiB) | 4 × 4096 × 4 bytes (u32 arrays) |
 | Batch (1024 slots) | ~15.5 MiB plaintext / 64 MiB ciphertext | |
@@ -60,6 +60,27 @@ With a per-batch failure probability of 2⁻¹⁰⁶ and B = 1024 slots:
 | No flooding (κ_f = 0) | ≈ 1.5 × 10¹⁰ | ~476 years at 1 rerand/s |
 | With flooding (κ_f = 8.58 × 10⁸) | ≈ 1.4 × 10¹⁰ additional | ~448 years at 1 rerand/s |
 
+## Choosing the flood sampler
+
+`encrypt_slot` and `encrypt_batch` take a `FloodSampler` that fully specifies the flood packet (width and method), so the two can never disagree:
+
+```rust
+use pq_rerand::encrypt::encrypt_slot;
+use pq_rerand::sampling::{FloodSampler, KarneyParams};
+
+// Published configuration: constant-time inverse-CDF sampler at σ_f = 93,733.236.
+let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::INVERSE_CDF);
+// Exact discrete Gaussian D_{Z,σ_f} (Karney's algorithm; variable-time, see above).
+let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::KARNEY);
+// Another width for the exact sampler, as a fraction (validated at construction).
+let ct = encrypt_slot(&mut rng, &ctx, &pk, &message,
+                      FloodSampler::Karney(KarneyParams::new(7, 3).unwrap()));
+// No flooding (κ_f = 0).
+let ct = encrypt_slot(&mut rng, &ctx, &pk, &message, FloodSampler::None);
+```
+
+`FloodSampler::default()` is `INVERSE_CDF`. The exact sampler is a port of Karney's `DiscreteNormal` (RandomLib, MIT) using 8-bit random digits served from a 512-byte buffer, a branch-free evaluation of the Bernoulli(e^{-1/2}) trials on four-digit windows with an exact digit-by-digit continuation on ties, and a division-free leading-digit step; the tests check it against the exact probability mass function (chi-square at 2·10⁶ samples for σ = 1, 7/3, 10, 21/2), check the window evaluation against the reference digit-by-digit formulation on 400,000 identical random streams, and check the flood-width moments. Decryption and re-randomization are unaffected by the choice.
+
 ## Benchmark results
 
 Measured on AMD Ryzen 7 260 (8C/16T, Zen 4, 3.8 GHz base / 5.0 GHz boost), 32 GiB DDR5, Linux 7.0, rustc 1.94.1, `--release` with `RUSTFLAGS="-C target-cpu=native"` (auto-vectorized; no hand-written SIMD intrinsics). Criterion medians.
@@ -69,9 +90,12 @@ Measured on AMD Ryzen 7 260 (8C/16T, Zen 4, 3.8 GHz base / 5.0 GHz boost), 32 Gi
 | Operation | 1 thread | 16 threads (per slot, B=1024) |
 |-----------|---------:|------------------------------:|
 | Key generation | 0.92 ms | — |
-| Encrypt (base + folded flood) | 0.80 ms | 0.096 ms |
+| Encrypt (base + folded flood, inverse-CDF) | 0.80 ms | 0.096 ms |
+| Encrypt (base + exact Karney flood) | 1.53 ms | 0.160 ms |
 | Re-randomize | 0.51 ms | 0.070 ms |
 | Decrypt | 0.21 ms | 0.025 ms |
+
+The flood samplers alone, per polynomial of 4,096 coefficients at the same fixed frequency: inverse-CDF 0.092 ms (22 ns per coefficient), exact Karney 0.330 ms (81 ns per coefficient); the base-width CDT sampler takes 0.066 ms. The exact sampler costs about 3.6× the constant-time one per coefficient and adds 0.72 ms to a single-threaded encryption (three flood polynomials); re-randomization and decryption do not sample a flood packet and are unchanged. The sampler is integer-only (no floating-point path on mobile CPUs), consumes about 20 random bytes per coefficient, and its cost is dominated by data-dependent branches (about 7 mispredictions per coefficient), which is inherent to exact rejection sampling.
 
 With turbo boost enabled (OS-default scaling): encrypt 0.63 ms, re-randomize 0.41 ms, decrypt 0.16 ms (single thread).
 
@@ -98,7 +122,7 @@ pq-rerand/
 │   │   ├── params.rs          # Scheme parameters and constants
 │   │   ├── ntt.rs             # Negacyclic NTT (Barrett/Shoup, branchless, const tables)
 │   │   ├── poly.rs            # CRT polynomial types and ring arithmetic
-│   │   ├── sampling.rs        # Constant-time CDT + inverse-CDF Gaussian samplers
+│   │   ├── sampling.rs        # CDT + inverse-CDF samplers, exact Karney sampler, FloodSampler
 │   │   ├── encoding.rs        # 31-bit plaintext encoding (bytes ↔ coefficients)
 │   │   ├── keygen.rs          # Key generation (zeroized secret key, cached NTT)
 │   │   ├── encrypt.rs         # Encryption with folded noise flooding
@@ -150,7 +174,7 @@ sage tools/lattice_estimate_sage.py
 ## How it works
 
 1. **KeyGen**: sample secret `s` and error `e` from a narrow Gaussian; compute `b = a·s + e` in both CRT limbs.
-2. **Encrypt**: sample randomness `(r, e₁, e₂)`, compute `c₁ = a·r + e₁` and `c₀ = b·r + e₂ + Δ_t·M` (t-limb) / `c₀ = b·r + e₂` (q₂-limb). Optionally add a one-time flooding encryption of zero.
+2. **Encrypt**: sample randomness `(r, e₁, e₂)`, compute `c₁ = a·r + e₁` and `c₀ = b·r + e₂ + Δ_t·M` (t-limb) / `c₀ = b·r + e₂` (q₂-limb). Optionally add a one-time flooding encryption of zero, whose Gaussian is sampled either by the constant-time inverse-CDF sampler or exactly by Karney's algorithm (`FloodSampler`).
 3. **ReRand**: sample fresh `(r', e₁', e₂')` and add `Enc(pk, 0)` to the ciphertext.
 4. **Decrypt**: compute `v = c₀ - c₁·s` in each limb. The q₂-limb `v_{q₂}` is pure noise (since `Δ·M ≡ 0 mod q₂`). Center-lift to recover the signed noise `ν`, then recover `M = (v_t - ν) · Δ_t⁻¹ mod t`.
 

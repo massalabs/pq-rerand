@@ -34,6 +34,14 @@ pub const KAPPA_F: u64 = 858_000_000;
 /// 3.2 · √858_000_000 = 3.2 · 29291.6368… = 93733.236…
 pub const SIGMA_FLOOD: f64 = 93_733.236;
 
+/// The flood width as an exact fraction, `SIGMA_FLOOD_NUM / SIGMA_FLOOD_DEN =
+/// 93_733_236 / 1000 = 93 733.236`, for the exact discrete-Gaussian flood sampler
+/// ([`crate::sampling::FloodSampler::KARNEY`]), which takes σ as a rational.
+/// Equal to `SIGMA_FLOOD` (checked by a test).
+pub const SIGMA_FLOOD_NUM: u64 = 93_733_236;
+/// Denominator of the flood width fraction; see [`SIGMA_FLOOD_NUM`].
+pub const SIGMA_FLOOD_DEN: u64 = 1_000;
+
 /// Noise-budget threshold: a coefficient decrypts correctly iff |ν| < q₂/2
 /// (paper Theorem 4.3). With q₂ ≈ 2³², q₂/2 ≈ 2.147 × 10⁹.
 pub const NOISE_THRESHOLD: u32 = Q2 / 2;
@@ -90,6 +98,8 @@ mod tests {
         let expected = SIGMA * (KAPPA_F as f64).sqrt();
         let diff = (SIGMA_FLOOD - expected).abs();
         assert!(diff < 0.5, "SIGMA_FLOOD is off: {} vs {}", SIGMA_FLOOD, expected);
+        // The exact fraction used by the Karney sampler is the same number.
+        assert_eq!(SIGMA_FLOOD_NUM as f64 / SIGMA_FLOOD_DEN as f64, SIGMA_FLOOD);
     }
 
     #[test]
