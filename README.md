@@ -24,7 +24,7 @@ This construction is engineered around a **two-limb CRT modulus** `q = t · q₂
 
 **This implementation has not yet been externally audited.** It is written to production-quality standards and is intended to be audit-ready:
 
-- The base-width Gaussian sampler (keygen, base encryption, re-randomization) is a **constant-time CDT** discrete-Gaussian sampler (fixed-length branchless table scan). Its table is a constant: every nonzero magnitude has its probability in the discrete Gaussian rounded to the 63 bits of the uniform draw, and zero has the rest. The sampled distribution is within statistical distance 2^-60.96 of the discrete Gaussian and is the same on every platform.
+- The base-width Gaussian sampler (keygen, base encryption, re-randomization) is a **constant-time CDT** discrete-Gaussian sampler (fixed-length branchless table scan). Its table is a constant: every nonzero magnitude has its probability in the discrete Gaussian rounded to the 63 bits of the uniform draw, and zero has the rest. The sampled distribution is within statistical distance 2^-60.96 of the discrete Gaussian and is the same on every platform; `tools/lean/cdt_table.lean` rebuilds the table in Lean 4, compares it with the Rust constant and bounds that distance.
 - The flood-width sampler is a **branchless constant-time inverse-CDF** sampler (no rejection loop, no data-dependent branch or table indexing).
 - The NTT / modular-arithmetic layer — including the secret-dependent decryption path (center-lift and final reduction) — is **branchless and division-free by construction**: control flow and memory-access patterns are independent of operand values.
 - All RNG inputs are bounded by `rand_core::CryptoRng`, enforcing a CSPRNG at the type level (the bound cannot tell how the generator was seeded: seed it from the operating system). The samplers read the generator in a fixed, documented order, so a key pair derived from a seeded generator is the same on every platform. The library is `#![forbid(unsafe_code)]`.
@@ -111,7 +111,7 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release --example leakage
 
 ```
 pq-rerand/
-├── .github/workflows/ci.yml   # Tests (x86-64, aarch64, 32-bit ARM and x86), minimum Rust version, target builds, taint and residue checks
+├── .github/workflows/ci.yml   # Tests (x86-64, aarch64, 32-bit ARM and x86), minimum Rust version, target builds, taint, residue and sampler-table checks
 ├── rust_implem/               # Rust implementation (~850 LOC of library code, plus tests)
 │   ├── Cargo.toml
 │   ├── src/
@@ -136,10 +136,14 @@ pq-rerand/
 │   │   └── timings.rs         # Standalone timing harness (single + batch, 1/N threads)
 │   └── tests/
 │       └── correctness.rs     # Integration tests
-├── tools/                     # Python scripts for analysis and figures
+├── tools/                     # Analysis scripts and figures
 │   ├── make_figures.py        # Generate publication figures (requires numpy, matplotlib, scipy)
 │   ├── security_estimate.py   # HE Standard v1.1 security cross-check (pure Python)
-│   └── lattice_estimate_sage.py  # Lattice-estimator script (requires SageMath)
+│   ├── lattice_estimate_sage.py  # Lattice-estimator script (requires SageMath)
+│   └── lean/                  # Base sampler table, rebuilt and measured in Lean 4
+│       ├── cdt_table.lean     # Builds the table, compares it with the Rust constant, bounds its distance from the discrete Gaussian
+│       ├── cdt_table_out.txt  # Its output: the table and the distances of this and other constructions
+│       └── lean-toolchain     # Version of Lean
 ├── LICENSE                    # MIT
 └── README.md
 ```
@@ -172,6 +176,10 @@ python3 tools/security_estimate.py
 
 # Full lattice-estimator analysis (requires SageMath + lattice-estimator)
 sage tools/lattice_estimate_sage.py
+
+# Rebuild the table of the base sampler, compare it with the Rust constant and
+# bound its distance from the discrete Gaussian (requires Lean 4 through elan)
+(cd tools/lean && lean ./cdt_table.lean)
 ```
 
 ## How it works

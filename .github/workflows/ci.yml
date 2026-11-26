@@ -116,6 +116,24 @@ jobs:
             flood && /<[^:<>+]+>$/ && !/<memset(@plt)?>$/ { print; bad = 1 }
             END { exit bad || !seen }'
 
+  table:
+    # The table of the base sampler is built in Lean from the definition of the
+    # distribution: it must be the constant of the Rust source, at the distances
+    # from the discrete Gaussian that the output file states.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Named explicitly, bash stops on a failed pipeline: both steps are one.
+        shell: bash
+        working-directory: tools/lean
+    steps:
+      - uses: actions/checkout@v7
+      - run: curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+      # elan takes the version of Lean from lean-toolchain. The Lean file reads the
+      # Rust source and reports errors on its standard output, where diff shows them.
+      - run: ~/.elan/bin/lean ./cdt_table.lean | diff - cdt_table_out.txt
+
   targets:
     # The library must build for mobile and WebAssembly targets.
     runs-on: ubuntu-latest

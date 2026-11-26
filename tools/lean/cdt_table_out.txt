@@ -1,0 +1,38 @@
+Table of the base-width Gaussian sampler (const CDT in rust_implem/src/sampling.rs)
+
+    1_149_872_835_429_266_009, 3_340_023_666_152_832_879, 5_231_742_854_224_525_756,
+    6_713_673_034_491_318_535, 7_766_573_326_200_196_560, 8_445_050_402_542_556_635,
+    8_841_576_285_654_612_685, 9_051_758_678_878_186_098, 9_152_802_451_769_415_981,
+    9_196_859_074_767_746_707, 9_214_281_206_174_004_122, 9_220_529_764_022_708_443,
+    9_222_562_339_745_873_208, 9_223_161_995_634_596_966, 9_223_322_447_917_711_090,
+    9_223_361_386_320_111_734, 9_223_369_956_674_611_013, 9_223_371_667_508_612_692,
+    9_223_371_977_254_386_297, 9_223_372_028_116_140_534, 9_223_372_035_690_845_300,
+    9_223_372_036_713_969_872, 9_223_372_036_839_307_003, 9_223_372_036_853_232_779,
+    9_223_372_036_854_636_069, 9_223_372_036_854_764_321, 9_223_372_036_854_774_952,
+    9_223_372_036_854_775_751, 9_223_372_036_854_775_805,
+
+Every threshold is above the ideal cumulative value, by 0.56 to 2.41 units of 2^-63:
+no tail |x| > k is heavier than in the discrete Gaussian.
+
+Distance of the sampled distribution from the discrete Gaussian, per sample
+
+table                                          entries  largest    statistical  Renyi 2     Renyi infinity
+                                                        magnitude  distance     minus 1     minus 1
+sampler: probabilities rounded, rest to zero   29       29         2^-60.96     2.647e-20   1.182e-5
+same, the last unit on magnitude 5             29       29         2^-61.05     2.647e-20   1.182e-5
+same, the last unit on magnitude 28            29       29         2^-61.08     2.650e-20   9.295e-3
+cumulative values rounded to nearest           29       29         2^-60.79     3.484e-20   1.869e-1
+cumulative values rounded down                 30       30         2^-60.70     3.832e-19   4.290e0
+cut at magnitude 29, cumulative rounded down   29       29         2^-60.33     3.493e-20   1.869e-1
+accumulated in double precision                40       40         2^-50.44     3.780e3     1.135e19
+
+In the table, the statistical distances are upper bounds and the divergences
+are rounded down.
+
+Rounded to nearest, the probabilities add up to 2^63 - 1. Zero takes the unit
+that is left: on any other magnitude, a threshold falls below the ideal
+cumulative value. On 5 the unit gives the smallest Renyi divergence of order 2,
+on 28 the smallest statistical distance.
+
+No table with 63-bit thresholds has a statistical distance below 2^-61.10,
+nor a Renyi divergence of order 2 below 1 + 2.647e-20.

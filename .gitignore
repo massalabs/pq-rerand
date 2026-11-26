@@ -5,7 +5,7 @@
 !rust_implem/
 !rust_implem/**
 
-# Allow the Python tools
+# Allow the analysis tools
 !tools/
 !tools/**
 

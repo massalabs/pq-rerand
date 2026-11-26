@@ -99,10 +99,11 @@ fn sample_with<R: Rng + CryptoRng>(rng: &mut R, out: &mut [i32; N], sample: impl
 ///
 /// The table is a constant computed in exact arithmetic: it involves no floating
 /// point and is the same on every platform. The test
-/// `cdt_matches_exact_distribution` recomputes it. Per sample, the sampled
-/// distribution is within statistical distance 2^-60.96 of `D_{Z,sigma}`; its
-/// Renyi divergence from it is below 1 + 2.65e-20 at order 2 and below
-/// 1 + 1.19e-5 at order infinity.
+/// `cdt_matches_exact_distribution` recomputes it, and so does
+/// `tools/lean/cdt_table.lean`, which also checks the tails and measures the
+/// distances that follow. Per sample, the sampled distribution is within
+/// statistical distance 2^-60.96 of `D_{Z,sigma}`; its Renyi divergence from it is
+/// below 1 + 2.65e-20 at order 2 and below 1 + 1.19e-5 at order infinity.
 const CDT: [u64; 29] = [
     1_149_872_835_429_266_009, 3_340_023_666_152_832_879, 5_231_742_854_224_525_756,
     6_713_673_034_491_318_535, 7_766_573_326_200_196_560, 8_445_050_402_542_556_635,
