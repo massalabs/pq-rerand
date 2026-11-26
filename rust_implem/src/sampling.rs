@@ -84,27 +84,36 @@ fn sample_with<R: Rng + CryptoRng>(rng: &mut R, out: &mut [i32; N], sample: impl
 }
 
 /// Cumulative distribution table for the centered discrete Gaussian `D_{Z,sigma}`
-/// at `sigma = SIGMA`, folded onto non-negative magnitudes:
-/// `CDT[k] = round(2^63 * P(|x| <= k))` for `k = 0..=28`.
+/// at `sigma = SIGMA` (16/5 exactly), folded onto non-negative magnitudes: the
+/// magnitude `k` has probability `(CDT[k] - CDT[k-1]) / 2^63`, with `CDT[-1] = 0`
+/// and `CDT[29] = 2^63`.
 ///
-/// The next entry would round to exactly `2^63`, which no 63-bit draw reaches (the
-/// tail beyond 29 has mass 2^-65.3), so it is left out and 29 is the largest
-/// magnitude. The table is a constant computed in exact arithmetic (the test
-/// `cdt_matches_exact_distribution` recomputes it): it involves no floating point
-/// and is the same on every platform. Per sample, the sampled distribution is
-/// within statistical distance 2^-60.8 of `D_{Z,sigma}`; its Renyi divergence from
-/// it is below 1 + 3.5e-20 at order 2 and below 1.19 at order infinity.
+/// Every magnitude `k >= 1` has its probability in `D_{Z,sigma}` rounded to the
+/// nearest multiple of 2^-63, and zero takes what remains. The probability of 30
+/// rounds to zero (the tail beyond 29 has mass 2^-65.3), so 29 is the largest
+/// magnitude. Rounding the cumulative values instead would leave two rounding
+/// errors in the probability of every nonzero magnitude, and a distribution that
+/// is further from `D_{Z,sigma}`. No entry is below the exact cumulative value:
+/// no tail `|x| > k` is more likely than in `D_{Z,sigma}`, and a sample is
+/// sub-Gaussian with parameter `sigma`, like an exact one.
+///
+/// The table is a constant computed in exact arithmetic: it involves no floating
+/// point and is the same on every platform. The test
+/// `cdt_matches_exact_distribution` recomputes it. Per sample, the sampled
+/// distribution is within statistical distance 2^-60.96 of `D_{Z,sigma}`; its
+/// Renyi divergence from it is below 1 + 2.65e-20 at order 2 and below
+/// 1 + 1.19e-5 at order infinity.
 const CDT: [u64; 29] = [
-    1_149_872_835_429_266_008, 3_340_023_666_152_832_878, 5_231_742_854_224_525_755,
-    6_713_673_034_491_318_534, 7_766_573_326_200_196_559, 8_445_050_402_542_556_634,
-    8_841_576_285_654_612_683, 9_051_758_678_878_186_096, 9_152_802_451_769_415_979,
-    9_196_859_074_767_746_705, 9_214_281_206_174_004_120, 9_220_529_764_022_708_441,
-    9_222_562_339_745_873_206, 9_223_161_995_634_596_964, 9_223_322_447_917_711_088,
-    9_223_361_386_320_111_733, 9_223_369_956_674_611_012, 9_223_371_667_508_612_691,
-    9_223_371_977_254_386_295, 9_223_372_028_116_140_532, 9_223_372_035_690_845_298,
-    9_223_372_036_713_969_870, 9_223_372_036_839_307_001, 9_223_372_036_853_232_778,
-    9_223_372_036_854_636_068, 9_223_372_036_854_764_320, 9_223_372_036_854_774_951,
-    9_223_372_036_854_775_750, 9_223_372_036_854_775_804,
+    1_149_872_835_429_266_009, 3_340_023_666_152_832_879, 5_231_742_854_224_525_756,
+    6_713_673_034_491_318_535, 7_766_573_326_200_196_560, 8_445_050_402_542_556_635,
+    8_841_576_285_654_612_685, 9_051_758_678_878_186_098, 9_152_802_451_769_415_981,
+    9_196_859_074_767_746_707, 9_214_281_206_174_004_122, 9_220_529_764_022_708_443,
+    9_222_562_339_745_873_208, 9_223_161_995_634_596_966, 9_223_322_447_917_711_090,
+    9_223_361_386_320_111_734, 9_223_369_956_674_611_013, 9_223_371_667_508_612_692,
+    9_223_371_977_254_386_297, 9_223_372_028_116_140_534, 9_223_372_035_690_845_300,
+    9_223_372_036_713_969_872, 9_223_372_036_839_307_003, 9_223_372_036_853_232_779,
+    9_223_372_036_854_636_069, 9_223_372_036_854_764_321, 9_223_372_036_854_774_952,
+    9_223_372_036_854_775_751, 9_223_372_036_854_775_805,
 ];
 
 /// Largest magnitude of a base-width sample (about 9 sigma).
@@ -308,8 +317,8 @@ mod tests {
 
     /// Recompute the table from the definition of the discrete Gaussian, in
     /// fixed-point integer arithmetic with 100 fractional bits. The accumulated
-    /// truncation error is below 2^-90, far less than the distance (0.006 units of
-    /// 2^-63) between any exact entry and the nearest rounding boundary.
+    /// truncation error is below 2^-90, far less than the distance (0.0065 units of
+    /// 2^-63) between any exact probability and the nearest rounding boundary.
     #[test]
     fn cdt_matches_exact_distribution() {
         const ONE: u128 = 1 << 100;
@@ -326,20 +335,20 @@ mod tests {
             term = term * 25 / (512 * n);
             q = if n % 2 == 1 { q - term } else { q + term };
         }
-        // Folded weights: w(0) = rho(0), w(k) = 2 rho(k); acc[k] = w(0) + ... + w(k).
+        // Folded weights: w(0) = rho(0), w(k) = 2 rho(k).
         // rho(k) = rho(k-1) * q^(2k-1). Beyond k = 47 the weights are below 2^-160.
         let q2 = mul(q, q);
         let (mut rho, mut step) = (ONE, q);
-        let mut acc = vec![ONE];
-        for k in 1..48 {
+        let mut weights = vec![ONE];
+        for _ in 1..48 {
             rho = mul(rho, step);
             step = mul(step, q2);
-            acc.push(acc[k - 1] + 2 * rho);
+            weights.push(2 * rho);
         }
-        let norm = acc[acc.len() - 1];
-        // round(2^63 * acc[k] / norm), from the quotient with one more bit.
-        let rounded = |k: usize| {
-            let (mut rem, mut quo) = (acc[k], 0u128);
+        let norm: u128 = weights.iter().sum();
+        // round(2^63 * w / norm), from the quotient with one more bit.
+        let rounded = |w: u128| {
+            let (mut rem, mut quo) = (w, 0u128);
             for _ in 0..4 {
                 rem <<= 16;
                 quo = (quo << 16) | (rem / norm);
@@ -347,11 +356,16 @@ mod tests {
             }
             (quo + 1) >> 1
         };
+        // Probabilities of the magnitudes 1, 2, ...: zero takes what remains.
+        let probabilities: Vec<u128> = weights[1..].iter().map(|&w| rounded(w)).collect();
+        let mut threshold = (1 << 63) - probabilities.iter().sum::<u128>();
         for (k, &entry) in CDT.iter().enumerate() {
-            assert_eq!(entry as u128, rounded(k), "CDT[{k}]");
+            assert_eq!(entry as u128, threshold, "CDT[{k}]");
+            threshold += probabilities[k];
         }
-        // The table is complete: the entry it leaves out is the unreachable 2^63.
-        assert_eq!(rounded(CDT.len()), 1 << 63);
+        // The table is complete: beyond its largest magnitude the probabilities
+        // round to zero.
+        assert_eq!(threshold, 1 << 63);
     }
 
     /// The scan returns the number of thresholds at or below the draw, at every
