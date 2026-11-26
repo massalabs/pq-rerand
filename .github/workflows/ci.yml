@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: rust_implem
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable --no-self-update
+      # Debug builds check arithmetic overflow, release builds are what ships.
+      - run: cargo test
+      - run: cargo test --release
+      - run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
+      - run: cargo +1.88.0 test --release
+
+  secrets:
+    # On every build: no branch or address may depend on a secret (taint check
+    # under Valgrind), and no secret may stay in memory after use (memory scan).
+    # Both are properties of the compiled code, which depends on the flags.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, rustflags: "" }
+          - { os: ubuntu-latest, rustflags: "-C target-cpu=x86-64-v3" }
+          - { os: ubuntu-24.04-arm, rustflags: "" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable --no-self-update
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: cargo build --release --example ctgrind
+      - run: valgrind target/release/examples/ctgrind
+      - run: cargo run --release --example residue
+      # On x86 the generator selects its code at run time: the portable build
+      # once more, emulating a CPU without AVX2.
+      - if: matrix.os == 'ubuntu-latest' && matrix.rustflags == ''
+        run: sudo apt-get install -y qemu-user && qemu-x86_64 -cpu Nehalem target/release/examples/residue
+
+  x86-32:
+    # 32-bit x86: same results as on the 64-bit hosts, taint check, memory scan.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: i686-unknown-linux-musl
+      # The linker of the toolchain: the runner has no 32-bit C toolchain.
+      CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable --no-self-update && rustup target add $TARGET
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: cargo test --release --target $TARGET
+      - run: cargo build --release --example ctgrind --target $TARGET
+      - run: valgrind target/$TARGET/release/examples/ctgrind
+      - run: cargo run --release --example residue --target $TARGET
+      # The taint check once more at opt-level s, where a selection is more easily
+      # compiled to a branch.
+      - run: cargo build --release --example ctgrind --target $TARGET && valgrind target/$TARGET/release/examples/ctgrind
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: s
+
+  arm32:
+    # 32-bit ARM, under emulation: same results as on the 64-bit hosts, and the
+    # memory scan.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: armv7-unknown-linux-gnueabihf
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable --no-self-update && rustup target add $TARGET
+      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user
+      - run: cargo test --release --target $TARGET
+      - run: cargo run --release --example residue --target $TARGET
+      # The taint check does not run under emulation. Instead: the code of the
+      # crate must not call a rounding, conversion or division routine of the
+      # run-time libraries (round, __aeabi_d2lz, ...), which branch on their
+      # operand, and the flood sampler must call nothing but memset.
+      - run: |
+          arm-linux-gnueabihf-objdump -dC target/$TARGET/release/examples/residue | awk '
+            />:$/ { crate = /pq_rerand::/; flood = /pq_rerand::sampling::.*add_flood/; seen += flood }
+            crate && /<_*(round|trunc|floor|sqrt|__aeabi_[dfilu][0-9a-z_]*|__u?(div|mod|divmod)[sd]i[34])(@plt)?>$/ { print; bad = 1 }
+            flood && /<[^:<>+]+>$/ && !/<memset(@plt)?>$/ { print; bad = 1 }
+            END { exit bad || !seen }'
+
+  targets:
+    # The library must build for mobile and WebAssembly targets.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGETS: aarch64-linux-android armv7-linux-androideabi aarch64-apple-ios wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable --no-self-update && rustup target add $TARGETS
+      - run: for target in $TARGETS; do cargo build --release --lib --target $target || exit 1; done

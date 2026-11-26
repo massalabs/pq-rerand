@@ -9,6 +9,10 @@
 !tools/
 !tools/**
 
+# Allow the CI workflows
+!.github/
+!.github/**
+
 # Allow top-level files
 !.gitignore
 !README.md
