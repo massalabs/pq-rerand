@@ -51,6 +51,7 @@ pub const NUM_SLOTS: usize = 1024;
 
 /// Bytes of plaintext per slot (N coefficients of BITS_PER_COEFF bits each).
 pub const SLOT_BYTES: usize = N * BITS_PER_COEFF / 8; // 15_872
+const _: () = assert!((N * BITS_PER_COEFF).is_multiple_of(8), "a slot must hold whole bytes");
 
 /// Total plaintext capacity in bytes.
 pub const PLAINTEXT_BYTES: usize = NUM_SLOTS * SLOT_BYTES; // 16_252_928

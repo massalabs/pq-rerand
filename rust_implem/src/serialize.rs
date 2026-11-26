@@ -3,6 +3,9 @@
 //! Format per slot: c0_t[4096] | c0_q2[4096] | c1_t[4096] | c1_q2[4096]
 //! Each coefficient is a little-endian u32 (4 bytes).
 //! Total per slot: 4 × 4096 × 4 = 65,536 bytes = 64 KiB.
+//!
+//! The format carries no version or parameter tag (neither do serialized keys):
+//! a container that may outlive this parameter set must record one itself.
 
 use crate::params::{N, T, Q2};
 use crate::encrypt::CiphertextSlot;
@@ -29,12 +32,7 @@ pub fn deserialize_slot(data: &[u8]) -> Option<CiphertextSlot> {
     if data.len() != SLOT_CT_BYTES {
         return None;
     }
-    let mut ct = CiphertextSlot {
-        c0_t: [0u32; N],
-        c0_q2: [0u32; N],
-        c1_t: [0u32; N],
-        c1_q2: [0u32; N],
-    };
+    let mut ct = CiphertextSlot::zeroed();
     let arrays: [(&mut [u32; N], u32); 4] = [
         (&mut ct.c0_t, T),
         (&mut ct.c0_q2, Q2),
@@ -61,12 +59,7 @@ mod tests {
 
     #[test]
     fn test_serialize_roundtrip() {
-        let mut ct = CiphertextSlot {
-            c0_t: [0u32; N],
-            c0_q2: [0u32; N],
-            c1_t: [0u32; N],
-            c1_q2: [0u32; N],
-        };
+        let mut ct = CiphertextSlot::zeroed();
         ct.c0_t[0] = 42;
         ct.c0_q2[100] = 123456;
         ct.c1_t[N - 1] = 999999;
@@ -94,5 +87,19 @@ mod tests {
         let mut bytes = vec![0u8; SLOT_CT_BYTES];
         bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(deserialize_slot(&bytes).is_none());
+
+        // In every limb, at both ends: the modulus is rejected and the value just
+        // below it is accepted and written back unchanged.
+        for (limb, modulus) in [T, Q2, T, Q2].into_iter().enumerate() {
+            for index in [0, N - 1] {
+                let at = (limb * N + index) * 4;
+                let mut bytes = vec![0u8; SLOT_CT_BYTES];
+                bytes[at..at + 4].copy_from_slice(&modulus.to_le_bytes());
+                assert!(deserialize_slot(&bytes).is_none(), "limb {limb}: modulus accepted");
+                bytes[at..at + 4].copy_from_slice(&(modulus - 1).to_le_bytes());
+                let ct = deserialize_slot(&bytes).expect("reduced coefficient rejected");
+                assert_eq!(serialize_slot(&ct), bytes);
+            }
+        }
     }
 }
