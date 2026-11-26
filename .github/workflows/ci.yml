@@ -58,10 +58,15 @@ jobs:
       - run: cargo build --release --example ctgrind
       - run: valgrind target/release/examples/ctgrind
       - run: cargo run --release --example residue
-      # On x86 the generator selects its code at run time: the portable build
-      # once more, emulating a CPU without AVX2.
+      # On x86 the generator selects its code at run time: the memory scan once
+      # more, emulating a CPU without AVX2. A static build, so that the emulated
+      # CPU only runs the code of this build.
       - if: matrix.os == 'ubuntu-latest' && matrix.rustflags == ''
-        run: sudo apt-get install -y qemu-user && qemu-x86_64 -cpu Nehalem target/release/examples/residue
+        run: |
+          sudo apt-get install -y qemu-user
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --example residue --target x86_64-unknown-linux-musl
+          qemu-x86_64 -cpu Nehalem target/x86_64-unknown-linux-musl/release/examples/residue
 
   x86-32:
     # 32-bit x86: same results as on the 64-bit hosts, taint check, memory scan.
