@@ -7,20 +7,24 @@
 //!   (CDT) discrete Gaussian sampler ([`sample_gaussian_cdt`]). The per-coefficient
 //!   lookup scans the whole table unconditionally with branchless comparisons, so its
 //!   running time and memory-access pattern are independent of the secret value.
-//! * **Flood width** (`σ_f ≈ 93 733`): a CDT is impractical at this width
-//!   (>10^5 entries), so [`add_flood`] uses **constant-time inverse-transform
-//!   sampling**: a 53-bit uniform (a sign and a 52-bit mantissa) is mapped through a
-//!   branchless rational approximation of the probit (`inv_norm_cdf`) and rounded.
-//!   There is no rejection loop, no data-dependent branch and no table indexing, so
-//!   control flow and memory-access patterns are independent of the sampled value.
-//!   (The flood triple is part of the encryption randomness: it is as secret as the
-//!   base triple and reveals the plaintext just the same.)
+//! * **Flood width** (`sigma_f`, about 93,733): a table is impractical at this
+//!   width (more than 10^5 entries), so [`add_flood`] assembles each sample from
+//!   eight samples of a narrower table, as the digits of a number in base 4:
+//!   `x_0 + 4 x_1 + ... + 4^7 x_7`. Like the base sampler, it only compares,
+//!   selects and adds integers: there is no floating point, no rejection loop and
+//!   no branch or memory address that depends on the data, so control flow and
+//!   memory-access patterns are independent of the sampled value. (The flood
+//!   triple is part of the encryption randomness: it is as secret as the base
+//!   triple and reveals the plaintext just the same.)
 //!
-//!   The output is a rounded Gaussian with 53 bits of resolution, not an exact
-//!   discrete Gaussian: it is symmetric and bounded by `8.3 * sigma_f`, and its far
-//!   tail is quantized by the 53-bit input (beyond about `7 * sigma_f` an output
-//!   value is produced by at most a few inputs). Security does not rely on its
-//!   shape: flooding preserves pseudorandomness for any flood distribution (paper
+//!   A sum of independent discrete Gaussians is a discrete Gaussian again, up to
+//!   a negligible factor, when each term is wide enough next to the step of the
+//!   following one, as the digits are (see `flood_sample`). What the table of the
+//!   digits rounds away remains: no value is more likely than under
+//!   `D_{Z,sigma_f}` by a factor above 1 + 6.5e-8, values far in the tail are less
+//!   likely, none exceeds `7.93 * sigma_f`, and a sample is sub-Gaussian with
+//!   parameter `sigma_f`, like an exact one. Security does not rely on the shape:
+//!   flooding preserves pseudorandomness for any flood distribution (paper
 //!   Lemma 6.1).
 //!
 //! # Use of the generator
@@ -31,7 +35,7 @@
 //! platform or with the version of the `rand` crates. This is what makes a key pair
 //! derived from a seeded generator reproducible.
 
-use crate::params::{N, SIGMA_FLOOD};
+use crate::params::N;
 use core::hint::select_unpredictable;
 use rand_core::{CryptoRng, Rng};
 use zeroize::Zeroizing;
@@ -65,20 +69,25 @@ pub(crate) fn wiped<T>(draw: impl FnOnce() -> T) -> T {
     framed(draw)
 }
 
-/// The generator is read a few words at a time, ahead of the arithmetic on them:
-/// with the generator out of the way, the compiler can vectorize that arithmetic.
+/// The generator is read for a few coefficients at a time, ahead of the arithmetic
+/// on its words: with the generator out of the way, the compiler can vectorize
+/// that arithmetic.
 const CHUNK: usize = 16;
 const _: () = assert!(N.is_multiple_of(CHUNK));
 
-/// Replace every coefficient `c` of `out` by `sample(word, c)`, for consecutive
-/// `next_u64` words of `rng`.
+/// Replace every coefficient `c` of `out` by `sample(draws, c)`, for consecutive
+/// groups of `W` `next_u64` words of `rng`.
 #[inline(always)]
-fn sample_with<R: Rng + CryptoRng>(rng: &mut R, out: &mut [i32; N], sample: impl Fn(u64, i32) -> i32) {
-    let mut draws = Zeroizing::new([0u64; CHUNK]);
+fn sample_with<const W: usize, R: Rng + CryptoRng>(
+    rng: &mut R,
+    out: &mut [i32; N],
+    sample: impl Fn(&[u64; W], i32) -> i32,
+) {
+    let mut draws = Zeroizing::new([[0u64; W]; CHUNK]);
     for chunk in out.as_chunks_mut::<CHUNK>().0 {
-        draws.iter_mut().for_each(|draw| *draw = rng.next_u64());
-        for (c, &draw) in chunk.iter_mut().zip(draws.iter()) {
-            *c = sample(draw, *c);
+        draws.as_flattened_mut().iter_mut().for_each(|draw| *draw = rng.next_u64());
+        for (c, draws) in chunk.iter_mut().zip(draws.iter()) {
+            *c = sample(draws, *c);
         }
     }
 }
@@ -143,123 +152,73 @@ fn cdt_sample(draw: u64) -> i32 {
 ///
 /// Each coefficient consumes one `next_u64` (see `cdt_sample` for its bits).
 pub fn sample_gaussian_cdt<R: Rng + CryptoRng>(rng: &mut R, out: &mut [i32; N]) {
-    wiped(|| sample_with(rng, out, |draw, _| cdt_sample(draw)));
+    wiped(|| sample_with(rng, out, |&[draw], _| cdt_sample(draw)));
 }
 
-/// Smallest probability fed to the probit: `2^-54`, the midpoint of the first of
-/// the `2^53` cells that partition `(0, 1)`.
-const MIN_P: f64 = 1.0 / 18_014_398_509_481_984.0;
-
-/// Branchless, constant-time natural logarithm for a normal positive `f64`.
+/// Cumulative distribution table of one digit of a flood sample, laid out like
+/// [`CDT`] with 31-bit thresholds: the magnitude `k` has probability
+/// `(FLOOD_CDT[k] - FLOOD_CDT[k-1]) / 2^31`, with `FLOOD_CDT[-1] = 0` and
+/// `FLOOD_CDT[34] = 2^31`. The digits follow the centered discrete Gaussian of
+/// parameter `sigma_d = SIGMA_FLOOD / sqrt(S)`, about 5.54, where
+/// `S = 1 + 16 + ... + 16^7 = 286,331,153` is the sum of the squares of their
+/// weights `4^i`: the weighted sum then has the parameter `SIGMA_FLOOD`.
 ///
-/// Decomposes `x = m*2^e` by bit manipulation (`e` from the exponent field, `m` in
-/// `[1,2)` from the mantissa) and evaluates `ln(m) = 2*atanh((m-1)/(m+1))` with a
-/// fixed-degree odd series (`t <= 1/3`, truncation error `< 1.1e-13`). No branches
-/// and no table lookups, so it does not inherit libm's data-dependent timing. Valid
-/// for finite normal `x > 0`; this module only feeds it `p` in `[2^-54, 1/2)`.
+/// Every magnitude `k >= 1` has its probability in that distribution rounded
+/// down to a multiple of 2^-31, and zero takes what remains: 34 is the largest
+/// magnitude. No digit other than zero is more likely than in the discrete
+/// Gaussian, zero is by a factor below 1 + 1.14e-7, and no tail `|x| > k` is
+/// more likely: a digit is sub-Gaussian with parameter `sigma_d`, and a flood
+/// sample with parameter `SIGMA_FLOOD`.
+const FLOOD_CDT: [u32; 34] = [
+    154_660_945, 458_983_279, 748_786_686, 1_015_914_794, 1_254_246_669, 1_460_068_347,
+    1_632_115_122, 1_771_318_060, 1_880_335_682, 1_962_975_899, 2_023_612_191, 2_066_676_776,
+    2_096_281_044, 2_115_979_620, 2_128_666_703, 2_136_575_950, 2_141_348_549, 2_144_136_090,
+    2_145_712_009, 2_146_574_378, 2_147_031_149, 2_147_265_329, 2_147_381_540, 2_147_437_360,
+    2_147_463_312, 2_147_474_991, 2_147_480_078, 2_147_482_223, 2_147_483_098, 2_147_483_443,
+    2_147_483_575, 2_147_483_623, 2_147_483_640, 2_147_483_646,
+];
+
+/// The flood sample selected by four 64-bit draws: `x_0 + 4 x_1 + ... + 4^7 x_7`,
+/// where the low half of draw `i` selects the digit `x_2i` and its high half
+/// `x_(2i+1)`, each as a draw selects a sample in `cdt_sample`: the top 31 bits of
+/// the half are a uniform and its low bit is the sign.
+///
+/// For independent discrete Gaussians `y`, `y'` of parameter `s` and an integer
+/// `k` with `1 + k^2 <= s^2`, the sum `y + k y'` is a discrete Gaussian of
+/// parameter `s sqrt(1 + k^2)` up to a factor that differs from 1 by less than
+/// `2.1 exp(-2 pi^2 s^2 / (1 + k^2))`. The digits are combined in three such
+/// steps, with `k` = 4, 16 and 256, and `s^2 / (1 + k^2)` is at least 1.8 in
+/// each: over the three steps (the first applies to four pairs of digits, the
+/// second to two pairs of sums) these factors stay within 3e-15 of 1. What
+/// separates a flood sample from the discrete Gaussian is therefore the rounding
+/// of the table, whose effect the test `flood_sample_distribution` computes from
+/// the exact distribution of the sample.
 #[inline(always)]
-fn ct_ln(x: f64) -> f64 {
-    const LN2: f64 = core::f64::consts::LN_2;
-    debug_assert!((MIN_P..1.0).contains(&x), "ct_ln: input outside [2^-54, 1)");
-    let bits = x.to_bits();
-    // The exponent goes through i32: a 64-bit integer-to-float conversion is a
-    // variable-time library call on 32-bit targets.
-    let e = (((bits >> 52) & 0x7ff) as i32 - 1023) as f64;
-    let m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
-    let t = (m - 1.0) / (m + 1.0);
-    let t2 = t * t;
-    let t4 = t2 * t2;
-    // 2t*(1 + t^2/3 + t^4/5 + ... + t^22/23): the terms of even and of odd rank
-    // form two chains in t^4, half as long as one chain in t^2.
-    let even = ((((1.0 / 21.0 * t4 + 1.0 / 17.0) * t4 + 1.0 / 13.0) * t4 + 1.0 / 9.0) * t4 + 1.0 / 5.0) * t4 + 1.0;
-    let odd = ((((1.0 / 23.0 * t4 + 1.0 / 19.0) * t4 + 1.0 / 15.0) * t4 + 1.0 / 11.0) * t4 + 1.0 / 7.0) * t4 + 1.0 / 3.0;
-    e * LN2 + 2.0 * t * (even + t2 * odd)
+fn flood_sample(draws: &[u64; 4]) -> i32 {
+    let halves: [u32; 8] = core::array::from_fn(|i| (draws[i / 2] >> (32 * (i % 2))) as u32);
+    // The eight scans advance together, threshold by threshold. Both sides of a
+    // comparison are below 2^31: comparing them as signed integers gives the same
+    // result, and more targets have an instruction for it.
+    let mut digits = [0i32; 8];
+    for &threshold in FLOOD_CDT.iter() {
+        for (digit, &half) in digits.iter_mut().zip(halves.iter()) {
+            *digit += ((half >> 1) as i32 >= threshold as i32) as i32;
+        }
+    }
+    // Horner's rule from the last digit down, each with its sign: the result is
+    // at most 34 * (4^8 - 1) / 3 = 742,730 in magnitude.
+    let signed = |i: usize| select_unpredictable(halves[i] & 1 == 1, -digits[i], digits[i]);
+    (0..8).rev().fold(0, |x, i| 4 * x + signed(i))
 }
 
-/// Branchless approximation of the standard-normal quantile `Phi^-1(p)` on the
-/// lower half `p` in `(0, 1/2)`, where it is negative, via Acklam's rational
-/// approximation with mask-selected regions (relative error `< 1.15e-9`).
+/// Add an independent flood-width sample to every coefficient of `acc` (see the
+/// module docs and `flood_sample`). Every coefficient costs the same four draws,
+/// comparisons and additions, with no data-dependent branch or memory indexing.
 ///
-/// The sampler obtains the upper half by symmetry, so `1 - p` is never formed and
-/// `p` stays strictly inside the open interval. Both Acklam regions (lower tail /
-/// central) are evaluated unconditionally and combined with a `0.0/1.0` mask
-/// derived from the comparison, so there is no data-dependent control flow. `ln`
-/// uses the branchless [`ct_ln`]. The square root and the three divisions are
-/// single hardware instructions; whether their latency depends on the operands is
-/// a property of the CPU, which `examples/leakage.rs` measures.
-#[inline]
-#[allow(clippy::excessive_precision)] // keep Acklam's published constants verbatim
-fn inv_norm_cdf(p: f64) -> f64 {
-    const A: [f64; 6] = [
-        -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
-        1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00,
-    ];
-    const B: [f64; 5] = [
-        -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
-        6.680131188771972e+01, -1.328068155288572e+01,
-    ];
-    const C: [f64; 6] = [
-        -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
-        -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00,
-    ];
-    const D: [f64; 4] = [
-        7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
-        3.754408661907416e+00,
-    ];
-    const P_LOW: f64 = 0.02425;
-
-    // Region selector as 0.0/1.0 (the comparison compiles to setcc, not a branch).
-    let is_low = (p < P_LOW) as u8 as f64;
-
-    // Central region: rational in r = (p-0.5)².
-    let q = p - 0.5;
-    let r = q * q;
-    let cen_num = (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q;
-    let cen_den = ((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0;
-    let cen = cen_num / cen_den;
-
-    // Lower tail: rational in sqrt(-2 ln p).
-    let qt = (-2.0 * ct_ln(p)).sqrt();
-    let tail_num = ((((C[0] * qt + C[1]) * qt + C[2]) * qt + C[3]) * qt + C[4]) * qt + C[5];
-    let tail_den = (((D[0] * qt + D[1]) * qt + D[2]) * qt + D[3]) * qt + 1.0;
-    let tail = tail_num / tail_den;
-
-    is_low * tail + (1.0 - is_low) * cen
-}
-
-/// The flood sample selected by one 64-bit draw: bits 12 to 63 are a 52-bit
-/// mantissa `m`, bit 11 is the sign and the low 11 bits are unused.
-///
-/// The magnitude is `round(-SIGMA_FLOOD * Phi^-1(p))` with `p = (m + 1/2) / 2^53`,
-/// which lies in `[2^-54, 1/2 - 2^-54]`: the output is exactly symmetric and no
-/// sample exceeds `8.3 * SIGMA_FLOOD` in magnitude.
-#[inline(always)]
-fn flood_sample(draw: u64) -> i32 {
-    // 2^-53, half the spacing of the doubles in [1, 2).
-    const HALF_ULP: f64 = 1.0 / 9_007_199_254_740_992.0;
-    // p from the bits of 1 + m/2^52. Every step is exact and there is no
-    // integer-to-float conversion (a library call on some targets).
-    let m = f64::from_bits(0x3ff0_0000_0000_0000 | (draw >> 12));
-    let p = (m - 1.0 + HALF_ULP) * 0.5;
-    // Phi^-1(p) < 0. Round the magnitude to nearest by adding 1/2 and truncating
-    // through i32 (one instruction, where the library `round` and a 64-bit
-    // conversion may branch on the value), then apply the sign.
-    let mag = (0.5 - inv_norm_cdf(p) * SIGMA_FLOOD) as i32;
-    select_unpredictable((draw >> 11) & 1 == 1, -mag, mag)
-}
-
-/// Add an independent flood-width sample to every coefficient of `acc`: a rounded
-/// continuous Gaussian of standard deviation [`SIGMA_FLOOD`], by **constant-time
-/// inverse-transform sampling** (see module docs and `inv_norm_cdf`).
-///
-/// Unlike a rejection-based (Box-Muller/ziggurat) sampler, every coefficient costs
-/// exactly one uniform draw, one probit evaluation and one rounding, with no
-/// data-dependent branch or memory indexing.
-///
-/// Each coefficient consumes one `next_u64` (see `flood_sample` for its bits). The
-/// addition wraps, which the sums formed in this crate (below 2^20) never do.
+/// Each coefficient consumes four `next_u64` (see `flood_sample` for their bits).
+/// The addition wraps, which the sums formed in this crate (below 2^20) never do.
 pub fn add_flood<R: Rng + CryptoRng>(rng: &mut R, acc: &mut [i32; N]) {
-    wiped(|| sample_with(rng, acc, |draw, c| c.wrapping_add(flood_sample(draw))));
+    wiped(|| sample_with(rng, acc, |draws, c| c.wrapping_add(flood_sample(draws))));
 }
 
 /// Sample a polynomial uniformly in [0, modulus).
@@ -283,7 +242,7 @@ pub(crate) fn sample_uniform<R: Rng + CryptoRng>(rng: &mut R, modulus: u32, out:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{Q2, SIGMA, T};
+    use crate::params::{Q2, SIGMA, SIGMA_FLOOD, T};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand_core::{Infallible, TryCryptoRng, TryRng};
@@ -406,97 +365,121 @@ mod tests {
         }
     }
 
+    /// Recompute the table from the definition of the discrete Gaussian. Double
+    /// precision is enough here: its error is below 1e-6 units of 2^-31, and no
+    /// probability is within 5e-3 of a whole number of units.
     #[test]
-    fn ct_ln_matches_std() {
-        // Across the documented domain [2^-54, 1), including both ends of a binade.
-        let xs = [
-            MIN_P, 5.6e-17, 1e-12, 1e-6, 0.01, 0.02425, 0.1, 0.25, 0.3, 0.499_999_999_999,
-            0.5, 0.7, 0.97575, 0.999, 0.999_999,
-        ];
-        for &x in &xs {
-            let err = (ct_ln(x) - x.ln()).abs();
-            assert!(err < 1e-12, "ct_ln({x}) err = {err}");
+    fn flood_cdt_matches_exact_distribution() {
+        // rho(k) = exp(-k^2 / (2 sigma_d^2)), with sigma_d^2 = SIGMA_FLOOD^2 / S.
+        let weights: f64 = (0..8).map(|i| 16f64.powi(i)).sum();
+        let rho = |k: usize| (-((k * k) as f64) * weights / (2.0 * SIGMA_FLOOD * SIGMA_FLOOD)).exp();
+        let norm = 1.0 + 2.0 * (1..200).map(rho).sum::<f64>();
+        // Probabilities of the magnitudes 1, 2, ..., in units of 2^-31, rounded down
+        // until one vanishes: zero takes what remains.
+        let exact = |k: usize| 2.0 * rho(k) / norm * (1u64 << 31) as f64;
+        let probabilities: Vec<u32> = (1..).map(|k| exact(k) as u32).take_while(|&p| p > 0).collect();
+        assert!((1..=probabilities.len() + 1).all(|k| (exact(k) - exact(k).round()).abs() > 5e-3));
+        let mut threshold = (1 << 31) - probabilities.iter().sum::<u32>();
+        for (k, &entry) in FLOOD_CDT.iter().enumerate() {
+            assert_eq!(entry, threshold, "FLOOD_CDT[{k}]");
+            threshold += probabilities[k];
         }
+        assert_eq!(threshold, 1 << 31);
+        // Zero is more likely than in the discrete Gaussian, by less than 1.14e-7.
+        let excess = FLOOD_CDT[0] as f64 / (1u64 << 31) as f64 * norm - 1.0;
+        assert!((0.0..1.14e-7).contains(&excess), "{excess}");
     }
 
+    /// The exact distribution of a flood sample, computed from the table, against
+    /// the discrete Gaussian of parameter `SIGMA_FLOOD`. In double precision: the
+    /// sums below only add positive terms, and are exact to 1e-11.
     #[test]
-    fn inv_norm_cdf_known_quantiles() {
-        // (p, Phi^-1(p)) over the central region and the lower tail.
-        let cases = [
-            (0.25, -0.674_489_750_196_081_7),
-            (0.1, -1.281_551_565_544_600_5),
-            (0.025, -1.959_963_984_540_054_2),
-            (0.01, -2.326_347_874_040_841),
-            (0.001, -3.090_232_306_167_813_5),
-            (1e-6, -4.753_424_308_822_899),
-            (1e-10, -6.361_340_902_404_056),
-            (MIN_P, -8.292_361_075_813_595),
-        ];
-        for (p, want) in cases {
-            let got = inv_norm_cdf(p);
-            assert!((got / want - 1.0).abs() < 2e-9, "quantile({p}) = {got}, want {want}");
+    fn flood_sample_distribution() {
+        // One digit: the value d is at index d + 34.
+        let top = FLOOD_CDT.len();
+        let mut dist = vec![0.0f64; 2 * top + 1];
+        let mut below = 0;
+        for (k, threshold) in FLOOD_CDT.iter().copied().chain([1 << 31]).enumerate() {
+            // Half of the probability of the magnitude k on each sign (both on 0).
+            let half = (threshold - below) as f64 / (1u64 << 32) as f64;
+            dist[top + k] += half;
+            dist[top - k] += half;
+            below = threshold;
         }
+        // y + k y' for two independent copies of what precedes: digits by pairs,
+        // then pairs by pairs, then the two halves of the sample.
+        for k in [4, 16, 256] {
+            let mut sum = vec![0.0; (k + 1) * (dist.len() - 1) + 1];
+            for (j, &high) in dist.iter().enumerate() {
+                for (to, &low) in sum[k * j..].iter_mut().zip(dist.iter()) {
+                    *to += low * high;
+                }
+            }
+            dist = sum;
+        }
+        let reach = (dist.len() / 2) as i32;
+        assert_eq!(reach, 742_730);
+        assert!((dist.iter().sum::<f64>() - 1.0).abs() < 1e-11);
+
+        // The discrete Gaussian: at this width its normalization is that of the
+        // continuous one, to more than 300 digits.
+        let variance = SIGMA_FLOOD * SIGMA_FLOOD;
+        let ideal = |x: i32| (-(x as f64).powi(2) / (2.0 * variance)).exp() / (2.0 * core::f64::consts::PI * variance).sqrt();
+        let ratios = || (-reach..=reach).zip(dist.iter()).map(|(x, &p)| (x, p / ideal(x)));
+        // No value is more likely than in the discrete Gaussian by a factor above
+        // 1 + 6.5e-8, reached at zero. This bounds the Renyi divergence of order
+        // infinity of the sample from the discrete Gaussian, which is what the
+        // analysis of the flood packet uses of its condition on the two
+        // distributions (paper section 6: a log-ratio within 7.2e-5).
+        let (at, largest) = ratios().fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+        assert!(at == 0 && largest < 1.0 + 6.5e-8, "ratio {largest} at {at}");
+        // Within 4 sigma_f the two distributions agree to 1e-5 either way. Further
+        // out the rounding of the table makes a value less likely, never more.
+        let bulk = (4.0 * SIGMA_FLOOD) as i32;
+        assert!(ratios().filter(|&(x, _)| x.abs() <= bulk).all(|(_, r)| (r - 1.0).abs() < 1e-5));
+        // The variance is that of the discrete Gaussian to 2e-7: the rounding of the
+        // table lowers it.
+        let second: f64 = (-reach..=reach).zip(dist.iter()).map(|(x, &p)| (x as f64).powi(2) * p).sum();
+        assert!((second / variance - 1.0).abs() < 2e-7, "{second}");
     }
 
-    /// Flood sample for the 53-bit input `v`: its low bit is the sign, the other 52
-    /// bits are the mantissa.
-    fn flood_at(v: u64) -> i32 {
-        flood_sample(v << 11)
-    }
-
-    /// The sampler at the ends and in the middle of its input space, against the
-    /// rounded quantiles of the exact Gaussian. No input reaches p = 0 or p = 1.
+    /// Each half of a draw selects its digit like `cdt_sample`, and the digits have
+    /// the weights 1, 4, ..., 4^7 in the order of the halves.
     #[test]
-    fn flood_sampler_edge_inputs() {
-        const TOP: u64 = (1 << 53) - 1;
-        let cases = [
-            (0, 777_270),
-            (1, -777_270),
-            (2, 764_930),
-            (4, 759_125),
-            (6, 755_278),
-            ((1 << 52) - 1, -63_222),
-            (1 << 52, 63_222),
-            (TOP - 1, 0),
-            (TOP, 0),
-        ];
-        for (v, want) in cases {
-            assert_eq!(flood_at(v), want, "input {v}");
+    fn flood_sampler_digits() {
+        assert_eq!(flood_sample(&[0; 4]), 0);
+        assert_eq!(flood_sample(&[1 | 1 << 32; 4]), 0);
+        // All-ones words: every digit is the largest magnitude, with a minus sign.
+        let top = FLOOD_CDT.len() as i32;
+        assert_eq!(flood_sample(&[u64::MAX; 4]), -top * 21_845);
+        assert_eq!(flood_sample(&[u64::MAX - 1 - (1 << 32); 4]), top * 21_845);
+        for position in 0..8 {
+            let weight = 4i32.pow(position);
+            let alone = |half: u32| {
+                let mut draws = [0u64; 4];
+                draws[position as usize / 2] = (half as u64) << (32 * (position % 2));
+                flood_sample(&draws)
+            };
+            for (k, &threshold) in FLOOD_CDT.iter().enumerate() {
+                // u = FLOOD_CDT[k]: magnitude k + 1, plus sign (low bit clear).
+                assert_eq!(alone(threshold << 1), (k as i32 + 1) * weight, "digit {position}, u = FLOOD_CDT[{k}]");
+                // u = FLOOD_CDT[k] - 1: magnitude k, minus sign (low bit set).
+                assert_eq!(alone(((threshold - 1) << 1) | 1), -(k as i32) * weight, "digit {position}, u = FLOOD_CDT[{k}] - 1");
+            }
         }
-        // The unused low bits do not matter, and an all-ones word gives the
-        // smallest magnitude.
-        assert_eq!(flood_sample(0x7ff), 777_270);
-        assert_eq!(flood_sample(u64::MAX), 0);
-        // The sampler adds the sample of each generator word, in order, to what
-        // the buffer holds.
-        let draws: Vec<u64> = (0..5 * CHUNK as u64 / 2).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        // All eight digits at once, with different magnitudes and signs.
+        let digits = [1, -6, -34, 13, 21, 2, -29, -10];
+        let half = |d: i32| ((FLOOD_CDT[d.unsigned_abs() as usize - 1] << 1) | (d < 0) as u32) as u64;
+        let draws: [u64; 4] = std::array::from_fn(|i| half(digits[2 * i]) | half(digits[2 * i + 1]) << 32);
+        assert_eq!(flood_sample(&draws), (0..8).map(|i| digits[i] * 4i32.pow(i as u32)).sum::<i32>());
+        // The sampler adds the sample of each group of four generator words, in
+        // order, to what the buffer holds.
+        let draws: Vec<u64> = (0..5 * 4 * CHUNK as u64 / 2).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
         let mut acc: [i32; N] = std::array::from_fn(|i| i as i32);
         add_flood(&mut Script(draws.clone(), 0), &mut acc);
+        let groups = draws.as_chunks::<4>().0;
         for (i, &x) in acc.iter().enumerate() {
-            assert_eq!(x, i as i32 + flood_sample(draws[i % draws.len()]), "coefficient {i}");
-        }
-        let mut acc = [5i32; N];
-        add_flood(&mut Script(vec![0, 1 << 11], 0), &mut acc);
-        assert_eq!(acc[..4], [777_275, -777_265, 777_275, -777_265]);
-    }
-
-    /// The magnitude is non-increasing in the mantissa and the sign bit mirrors it:
-    /// in the far tail, across the boundary between the two regions of the
-    /// approximation (p = 0.02425), over the whole range and around the center.
-    #[test]
-    fn flood_sampler_is_monotonic() {
-        let boundary = (0.02425 * (1u64 << 53) as f64) as u64;
-        let mut mantissas: Vec<u64> = (0..100).collect();
-        mantissas.extend((0..200).map(|j| boundary - (100 << 28) + (j << 28)));
-        mantissas.extend((0..52).flat_map(|i| [1u64 << i, 3u64 << i >> 1]));
-        mantissas.extend((0..200).map(|j| (1u64 << 52) - 1 - (j << 33)));
-        mantissas.sort_unstable();
-        let mut previous = i32::MAX;
-        for m in mantissas {
-            let x = flood_at(m << 1);
-            assert_eq!(flood_at((m << 1) | 1), -x, "mantissa {m}: not symmetric");
-            assert!((0..=previous).contains(&x), "mantissa {m}: {x} after {previous}");
-            previous = x;
+            assert_eq!(x, i as i32 + flood_sample(&groups[i % groups.len()]), "coefficient {i}");
         }
     }
 

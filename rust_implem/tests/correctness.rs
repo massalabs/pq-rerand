@@ -228,9 +228,9 @@ fn digest(bytes: &[u8]) -> u64 {
 fn test_known_answers() {
     // (seed byte, digests of the public key, secret key, ciphertext, re-randomized ciphertext)
     let vectors: [(u8, [u64; 4]); 3] = [
-        (1, [0x535a36f8fb8f7970, 0xef883001f8d26859, 0x6d107de92e2f1fb9, 0x5a6cdf1945e07613]),
-        (2, [0x6f6693337c982f14, 0x4b97040803cac428, 0x221e61afd64c72c0, 0x8f2b5615f655fbf2]),
-        (255, [0x531fa3634e572be1, 0x6d2e3075808998d9, 0x856e88a3e832fc28, 0x13a275ef3bb2c27e]),
+        (1, [0x535a36f8fb8f7970, 0xef883001f8d26859, 0xad160b239bbf48d9, 0x305b63e4b2eb74b7]),
+        (2, [0x6f6693337c982f14, 0x4b97040803cac428, 0xb08b752027c8fa2b, 0xe370ac6aee44651d]),
+        (255, [0x531fa3634e572be1, 0x6d2e3075808998d9, 0x59df3719c8cad91d, 0x4b5d75d692a7406a]),
     ];
     let got = vectors.map(|(seed, _)| {
         let mut rng = ChaCha20Rng::from_seed([seed; 32]);

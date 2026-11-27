@@ -25,15 +25,15 @@ This construction is engineered around a **two-limb CRT modulus** `q = t · q₂
 **This implementation has not yet been externally audited.** It is written to production-quality standards and is intended to be audit-ready:
 
 - The base-width Gaussian sampler (keygen, base encryption, re-randomization) is a **constant-time CDT** discrete-Gaussian sampler (fixed-length branchless table scan). Its table is a constant: every nonzero magnitude has its probability in the discrete Gaussian rounded to the 63 bits of the uniform draw, and zero has the rest. The sampled distribution is within statistical distance 2^-60.96 of the discrete Gaussian and is the same on every platform; `tools/lean/cdt_table.lean` rebuilds the table in Lean 4, compares it with the Rust constant and bounds that distance.
-- The flood-width sampler is a **branchless constant-time inverse-CDF** sampler (no rejection loop, no data-dependent branch or table indexing).
+- The flood-width sampler adds up eight samples of a second table, as the digits of a number in base 4, in **constant time and without floating point** (no rejection loop, no branch or memory address that depends on the data). No value is more likely than under the discrete Gaussian by a factor above 1 + 6.5e-8, and values far in the tail are less likely; a unit test computes the exact distribution of a sample from the table.
 - The NTT / modular-arithmetic layer — including the secret-dependent decryption path (center-lift and final reduction) — is **branchless and division-free by construction**: control flow and memory-access patterns are independent of operand values.
 - All RNG inputs are bounded by `rand_core::CryptoRng`, enforcing a CSPRNG at the type level (the bound cannot tell how the generator was seeded: seed it from the operating system). The samplers read the generator in a fixed, documented order, so a key pair derived from a seeded generator is the same on every platform. The library is `#![forbid(unsafe_code)]`.
 - Secret keys, plaintexts and transient secrets (encryption and re-randomization randomness, decryption intermediates) are held in heap storage that is zeroized on drop and are computed there in place: these arrays are not moved or returned through the stack. The per-slot generators of the batch layer are zeroized too, and the part of the stack that a generator worked on is wiped after each sampling call. Keys and ciphertexts keep their limbs on the heap, so in release builds no operation needs more than 16 KiB of stack with the shared `NTT_CONTEXT`, and a full batch runs on worker stacks of 256 KiB. These measures are best effort: a compiler may still spill individual values, and CPU registers keep parts of the last arrays they processed.
-- A TVLA/dudect-style fixed-vs-random timing-leakage harness (`cargo run --release --example leakage`) measures both samplers, key generation, encryption, re-randomization, decryption and secret-key parsing over their secret inputs (generator stream, secret key) as well as over plaintexts and ciphertexts, drawing the class of each measurement at random and reading the same memory whatever the class. On the machine of the benchmarks below, in portable and native builds (eight runs of 10,000 to 200,000 measurements per test), no sampler and no operation is flagged: the largest |t| is 3.3 against a threshold of 4.5, while a control with one data-dependent branch per coefficient gives |t| above 2400. It also runs the flood sampler on chosen inputs, as the latency of a floating-point division or square root depends on the operands on some CPUs.
+- A TVLA/dudect-style fixed-vs-random timing-leakage harness (`cargo run --release --example leakage`) measures both samplers, key generation, encryption, re-randomization, decryption and secret-key parsing over their secret inputs (generator stream, secret key) as well as over plaintexts and ciphertexts, drawing the class of each measurement at random and reading the same memory whatever the class. On the machine of the benchmarks below, in portable and native builds (eight runs of 10,000 to 200,000 measurements per test), no sampler and no operation is flagged: the largest |t| is 3.2 against a threshold of 4.5, while a control with one data-dependent branch per coefficient gives |t| above 3000.
 - A secret-taint harness (`examples/ctgrind.rs`, run under Valgrind) marks the secrets as undefined and checks that no conditional branch and no memory address depends on them, in the samplers and in every operation; only the final verdict of the two parsers of secret data (`SecretKey::from_bytes`, `decode`) may. It runs in CI on x86-64 (baseline and x86-64-v3 builds), 32-bit x86 and aarch64. It cannot run under emulation, nor on a build that uses AVX-512: on 32-bit ARM, CI checks instead that the compiled crate calls no rounding, conversion or division routine of the run-time libraries and that the flood sampler calls no library routine but `memset`. The 32-bit ARM and Android builds were otherwise checked by reading their assembly.
 - A memory-residue scan (`examples/residue.rs`) runs the operations on known secrets, drops everything, and searches the heap and the stacks of all threads of the process for the keys and the output of the generators, for the secrets in the forms in which the library holds them (keys, errors, encryption randomness and plaintexts, as sampled, reduced or transformed) and for what it computes from them on the way to its results (products with public values, the encryption of zero that a message is added to or that a re-randomization adds, the noisy plaintext of a decryption). Freed memory is not reused and every operation runs on threads of its own, so nothing is overwritten before the search. It runs in CI on x86-64 (baseline and x86-64-v3 builds), aarch64, 32-bit ARM and 32-bit x86.
 
-These properties hold for optimized builds without overflow checks (the release profile): debug builds branch on secret values and must not process real keys. They are properties of a build, not of the source alone, and on x86 of the CPU as well (the generator selects its code at run time; CI also runs the memory scan emulating a CPU without AVX2): repeat the taint check and the memory scan, like the timing assessment, on every target platform. The flood sampler computes in floating point, so it needs hardware floating point and relies on the division and square root of the CPU taking a time that does not depend on their operands.
+These properties hold for optimized builds without overflow checks (the release profile): debug builds branch on secret values and must not process real keys. They are properties of a build, not of the source alone, and on x86 of the CPU as well (the generator selects its code at run time; CI also runs the memory scan emulating a CPU without AVX2): repeat the taint check and the memory scan, like the timing assessment, on every target platform.
 
 Branchless source plus one leakage run is not a substitute for microarchitectural verification: production deployments should repeat the timing-leakage assessment on their target platform (desktop and mobile) and an external audit is recommended before production use.
 
@@ -89,13 +89,13 @@ Measured on AMD Ryzen 7 260 (8C/16T, Zen 4, 3.8 GHz base / 5.0 GHz boost), 32 Gi
 | Operation | 1 thread | 16 threads (per slot, B=1024) |
 |-----------|---------:|------------------------------:|
 | Key generation | 0.33 ms | - |
-| Encrypt (base + folded flood) | 0.41 ms | 0.053 ms |
+| Encrypt (base + folded flood) | 0.61 ms | 0.083 ms |
 | Re-randomize | 0.30 ms | 0.044 ms |
 | Decrypt | 0.16 ms | 0.022 ms |
 
-A portable build (no `target-cpu` flag) takes 0.43 ms, 0.66 ms, 0.45 ms and 0.22 ms on one thread at the same fixed frequency. With turbo boost enabled (OS-default scaling), the native build takes 0.31 ms to encrypt, 0.23 ms to re-randomize and 0.12 ms to decrypt (single thread).
+A portable build (no `target-cpu` flag) takes 0.43 ms, 0.79 ms, 0.45 ms and 0.22 ms on one thread at the same fixed frequency. With turbo boost enabled (OS-default scaling), the native build takes 0.49 ms to encrypt, 0.23 ms to re-randomize and 0.12 ms to decrypt (single thread).
 
-Versus the original reference implementation at the same fixed frequency (encrypt 3.24 ms, re-randomize 1.62 ms, decrypt 1.47 ms), the optimized arithmetic (Barrett reduction, Shoup-multiply butterflies with precomputed bit-reversed twiddles, folded flooding, cached key NTT) is **5.5 to 9.0 times faster** single-threaded; rayon batch operations add a further factor of about 7 across 16 hardware threads. A full 15.5 MiB batch (1024 slots) re-randomizes in 0.045 s and decrypts in 0.023 s on 16 threads.
+Versus the original reference implementation at the same fixed frequency (encrypt 3.24 ms, re-randomize 1.62 ms, decrypt 1.47 ms), the optimized arithmetic (Barrett reduction, Shoup-multiply butterflies with precomputed bit-reversed twiddles, folded flooding, cached key NTT) is **5.3 to 9.0 times faster** single-threaded; rayon batch operations add a further factor of about 7 across 16 hardware threads. A full 15.5 MiB batch (1024 slots) re-randomizes in 0.045 s and decrypts in 0.023 s on 16 threads.
 
 Reproduce with:
 
@@ -112,14 +112,14 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release --example leakage
 ```
 pq-rerand/
 ├── .github/workflows/ci.yml   # Tests (x86-64, aarch64, 32-bit ARM and x86), minimum Rust version, target builds, taint, residue and sampler-table checks
-├── rust_implem/               # Rust implementation (~850 LOC of library code, plus tests)
+├── rust_implem/               # Rust implementation (~800 LOC of library code, plus tests)
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── lib.rs             # Crate root (forbid(unsafe_code), security notes)
 │   │   ├── params.rs          # Scheme parameters and constants
 │   │   ├── ntt.rs             # Negacyclic NTT (Barrett/Shoup, branchless, const tables)
 │   │   ├── poly.rs            # NTT context, zeroizing storage and CRT-limb helpers
-│   │   ├── sampling.rs        # Constant-time CDT + inverse-CDF Gaussian samplers
+│   │   ├── sampling.rs        # Constant-time table samplers (base and flood widths)
 │   │   ├── encoding.rs        # 31-bit plaintext encoding (bytes ↔ coefficients)
 │   │   ├── keygen.rs          # Key generation (zeroized secret key, cached NTT)
 │   │   ├── encrypt.rs         # Encryption with folded noise flooding

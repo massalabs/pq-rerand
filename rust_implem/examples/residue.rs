@@ -83,7 +83,7 @@ static ALLOCATOR: NoReuse = NoReuse;
 /// plainer windows also match unrelated small numbers.
 const WORD: usize = 4;
 const KEY: usize = 32;
-const ARENA: usize = 1 << 21;
+const ARENA: usize = 1 << 22;
 /// Memory is read in pieces of this size, which overlap by one page.
 const PIECE: usize = 1 << 20;
 const PAGE: usize = 4096;
@@ -278,10 +278,10 @@ fn register_randomness(scanner: &mut Scanner, pk: &PublicKey) {
         scanner.add(&format!("key of generator {tag}, 8 bytes"), 8, (0..KEY).map(|i| byte(tag, i)));
     }
     for tag in 1..=3 {
-        // As much as the largest operation draws: a flooded encryption takes 6 N
+        // As much as the largest operation draws: a flooded encryption takes 15 N
         // words of 64 bits.
         let mut rng = generator(tag);
-        scanner.add(&format!("output of generator {tag}"), 8, (0..12 * N).flat_map(|_| rng.next_u32().to_le_bytes()));
+        scanner.add(&format!("output of generator {tag}"), 8, (0..30 * N).flat_map(|_| rng.next_u32().to_le_bytes()));
     }
     for (tag, flood, what) in [(2, true, "encryption"), (3, false, "re-randomization")] {
         let mut rng = generator(tag);
@@ -420,6 +420,8 @@ fn main() {
     let message = isolated(&mut kept, 1, || encode(slot));
     let fresh = isolated(&mut kept, 1, || encrypt_slot(&mut *generator(2), ctx, &pk, &message, Flooding::Standard));
     let ct = isolated(&mut kept, 1, || rerandomize_slot(&mut *generator(3), ctx, &pk, &fresh));
+    // The flood sampler on its own, outside the wiped frame of an encryption.
+    isolated(&mut kept, 1, || add_flood(&mut *generator(3), &mut zeros()));
     assert!(isolated(&mut kept, 1, || pk.verify_against(&sk)));
     drop(isolated(&mut kept, 1, || sk.clone()));
     drop((sk, message));

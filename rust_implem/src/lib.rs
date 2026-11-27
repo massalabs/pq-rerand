@@ -8,7 +8,8 @@
 //! * The base-width Gaussian sampler (keygen / base encryption /
 //!   re-randomization) is a constant-time CDT sampler
 //!   ([`sampling::sample_gaussian_cdt`]).
-//! * The flood-width sampler is a branchless constant-time inverse-CDF sampler
+//! * The flood-width sampler adds up eight samples of a second table, in constant
+//!   time like the base sampler and without floating point
 //!   ([`sampling::add_flood`]).
 //! * The NTT / modular-arithmetic layer — including the secret-dependent
 //!   decryption path (center-lift and final reduction) — is branchless and
@@ -48,10 +49,6 @@
 //! branches, so deployments should repeat these assessments on the
 //! target platform (desktop and mobile), and an external audit is recommended
 //! before production use.
-//!
-//! The flood sampler computes in floating point: it needs a target with hardware
-//! floating point, and relies on the division and square root of the CPU taking
-//! a time that does not depend on their operands.
 //!
 //! # Requirements on applications
 //!
