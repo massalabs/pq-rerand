@@ -22,6 +22,15 @@ pub const DELTA_T: u32 = {
 /// INV_DELTA_T = DELTA_T^(t-2) mod t. Used in decryption.
 pub const INV_DELTA_T: u32 = 1_987_184_532;
 
+/// Version of the serialized formats: the first byte of a serialized
+/// [`SecretKey`](crate::keygen::SecretKey) or [`PublicKey`](crate::keygen::PublicKey).
+/// It identifies the parameter set (`N`, `T`, `Q2`, `SIGMA`) and the encoding of
+/// keys, plaintexts and ciphertexts, including the NTT-domain order of public
+/// keys: a change to any of them must change this number, so that a key in
+/// another format is rejected instead of being misread. A key written without
+/// this byte is one byte short and is rejected as well.
+pub const FORMAT_VERSION: u8 = 1;
+
 /// Narrow Gaussian standard deviation (for keygen, rerand, base encrypt).
 /// Matches the paper's σ = 3.2.
 pub const SIGMA: f64 = 3.2;
