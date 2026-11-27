@@ -16,7 +16,10 @@
 //!     always replays one stream, the random class a fresh one;
 //!   * the secret key, for decryption and for secret-key parsing;
 //!   * the plaintext, for encryption, and the ciphertext, for re-randomization
-//!     and decryption.
+//!     and decryption;
+//!   * one coefficient of the ciphertext, for a decryption that fails: in one
+//!     class the slot decrypts to a payload, which `open` rejects, in the other
+//!     it does not decrypt to one.
 //!
 //! Whatever the class, the same work is done before a measurement and the
 //! operation runs on the same memory: an input that lives in memory is first
@@ -40,17 +43,21 @@
 //! Results are statistical and machine-dependent; run multiple times under low
 //! load, on every target the crate is deployed to.
 
-use pq_rerand::params::{N, T, SLOT_BYTES};
-use pq_rerand::poly::NTT_CONTEXT;
-use pq_rerand::keygen::{keygen, SecretKey};
-use pq_rerand::encoding::encode;
-use pq_rerand::encrypt::{encrypt_slot, Flooding};
-use pq_rerand::rerandomize::rerandomize_slot;
-use pq_rerand::decrypt::decrypt_slot;
-use pq_rerand::sampling::{add_flood, sample_gaussian_cdt};
-use pq_rerand::serialize::{deserialize_slot, serialize_slot};
+// The samplers of the library, compiled into this program as well, to measure
+// them on their own.
+#[allow(dead_code)]
+#[path = "../src/sampling.rs"]
+mod sampling;
+mod params {
+    pub use pq_rerand::params::*;
+}
+
+use pq_rerand::params::{DELTA_T, N, T, SLOT_BYTES};
+use pq_rerand::{decrypt_slot, encrypt_slot, keygen, rerandomize_slot};
+use pq_rerand::{CiphertextSlot, Flooding, SecretKey};
 use rand::{Rng, SeedableRng, TryCryptoRng, TryRng};
 use rand::rngs::StdRng;
+use sampling::{add_flood, sample_gaussian_cdt};
 use std::convert::Infallible;
 use std::hint::black_box;
 
@@ -206,15 +213,22 @@ fn random_slot(rng: &mut StdRng) -> [u8; SLOT_BYTES] {
     data
 }
 
+/// Stands for the authenticated decryption of an application: it reads the whole
+/// payload, one byte after the other, and rejects it, which the compiler cannot
+/// tell in advance. The decryptions measured here fail, and a call that did not
+/// reach `open` would be shorter.
+fn reject(payload: &mut [u8; SLOT_BYTES]) -> Option<()> {
+    black_box(payload.iter().fold(0u32, |sum, &byte| sum.wrapping_mul(31).wrapping_add(byte as u32)));
+    black_box(None)
+}
+
 fn main() {
     let scale: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let ctx = &NTT_CONTEXT;
     // Fixed test inputs: reproducible measurements, not a way to seed real keys.
     let mut rng = StdRng::seed_from_u64(1);
-    let (sk, pk) = keygen(&mut rng, ctx);
+    let (sk, pk) = keygen(&mut rng);
     let fixed_data = random_slot(&mut rng);
-    let fixed_msg = encode(&fixed_data);
-    let fixed_ct = encrypt_slot(&mut rng, ctx, &pk, &fixed_msg, Flooding::Standard);
+    let fixed_ct = encrypt_slot(&mut rng, &pk, &fixed_data, Flooding::Standard);
 
     // Generator streams: the fixed class always replays one, the random class
     // takes a fresh one (which is drawn in both cases).
@@ -229,11 +243,21 @@ fn main() {
     // Inputs that live in memory, in serialized form: the fixed value and a pool
     // of random ones.
     let fixed_key = sk.to_bytes();
-    let random_keys: Vec<Vec<u8>> = (0..POOL).map(|_| keygen(&mut rng, ctx).0.to_bytes().to_vec()).collect();
+    let random_keys: Vec<Vec<u8>> = (0..POOL).map(|_| keygen(&mut rng).0.to_bytes().to_vec()).collect();
     let random_payloads: Vec<[u8; SLOT_BYTES]> = (0..POOL).map(|_| random_slot(&mut rng)).collect();
-    let fixed_ct_bytes = serialize_slot(&fixed_ct);
-    let encrypted = |d| serialize_slot(&encrypt_slot(&mut rng, ctx, &pk, &encode(d), Flooding::Standard));
+    let fixed_ct_bytes = fixed_ct.to_bytes();
+    let encrypted = |d| encrypt_slot(&mut rng, &pk, d, Flooding::Standard).to_bytes();
     let random_cts: Vec<Vec<u8>> = random_payloads.iter().map(encrypted).collect();
+    // The fixed ciphertext with the first coefficient of its message, m, raised to
+    // 2^31 by adding Delta_t * (2^31 - m) to the first word of c0: this slot does
+    // not decrypt to a payload.
+    let mut invalid_ct_bytes = fixed_ct_bytes.clone();
+    let m = u32::from_le_bytes(fixed_data[..4].try_into().unwrap()) & 0x7fff_ffff;
+    let c0 = u32::from_le_bytes(invalid_ct_bytes[..4].try_into().unwrap()) as u64;
+    let shift = DELTA_T as u64 * ((1 << 31) - m as u64) % T as u64;
+    invalid_ct_bytes[..4].copy_from_slice(&(((c0 + shift) % T as u64) as u32).to_le_bytes());
+    let invalid_ct = CiphertextSlot::from_bytes(&invalid_ct_bytes).expect("reduced");
+    assert!(decrypt_slot(&sk, &fixed_ct, |_| Some(())).is_some() && decrypt_slot(&sk, &invalid_ct, |_| Some(())).is_none());
     // For the branch control only: one pool of inputs per class.
     let below: [u32; N] = std::array::from_fn(|_| rng.next_u32() % T);
     let anywhere: Vec<[u32; N]> = (0..POOL).map(|_| std::array::from_fn(|_| rng.next_u32())).collect();
@@ -274,22 +298,22 @@ fn main() {
     });
     run("keygen (fixed a)", 5_000 * scale, |class| {
         let mut g = Split { words32: StdRng::from_seed(fixed_seed), words64: StdRng::from_seed(seed_for(class)) };
-        ticks(|| keygen(&mut g, ctx))
+        ticks(|| keygen(&mut g))
     });
     run("encrypt_slot", 5_000 * scale, |class| {
         let mut g = StdRng::from_seed(seed_for(class));
-        ticks(|| encrypt_slot(&mut g, ctx, &pk, &fixed_msg, Flooding::Standard))
+        ticks(|| encrypt_slot(&mut g, &pk, &fixed_data, Flooding::Standard))
     });
     run("rerandomize_slot", 5_000 * scale, |class| {
         let mut g = StdRng::from_seed(seed_for(class));
-        ticks(|| rerandomize_slot(&mut g, ctx, &pk, &fixed_ct))
+        ticks(|| rerandomize_slot(&mut g, &pk, &fixed_ct))
     });
 
     println!("\nSecret key (fixed vs. random key):");
     run("decrypt_slot", 20_000 * scale, |class| {
         select(&mut work_key, &fixed_key, &random_keys[next()], class);
         let key = SecretKey::from_bytes(&work_key).expect("valid key");
-        ticks(|| decrypt_slot(ctx, &key, &fixed_ct))
+        ticks(|| decrypt_slot(&key, &fixed_ct, reject))
     });
     run("SecretKey::from_bytes", 20_000 * scale, |class| {
         select(&mut work_key, &fixed_key, &random_keys[next()], class);
@@ -300,19 +324,25 @@ fn main() {
     run("encrypt_slot (plaintext)", 5_000 * scale, |class| {
         let mut g = StdRng::from_seed(fixed_seed);
         select(&mut work_payload, &fixed_data, &random_payloads[next()], class);
-        let msg = encode(&work_payload);
-        ticks(|| encrypt_slot(&mut g, ctx, &pk, &msg, Flooding::Standard))
+        ticks(|| encrypt_slot(&mut g, &pk, &work_payload, Flooding::Standard))
     });
     run("rerandomize_slot (ciphertext)", 5_000 * scale, |class| {
         let mut g = StdRng::from_seed(fixed_seed);
         select(&mut work_ct, &fixed_ct_bytes, &random_cts[next()], class);
-        let ct = deserialize_slot(&work_ct).expect("valid ciphertext");
-        ticks(|| rerandomize_slot(&mut g, ctx, &pk, &ct))
+        let ct = CiphertextSlot::from_bytes(&work_ct).expect("valid ciphertext");
+        ticks(|| rerandomize_slot(&mut g, &pk, &ct))
     });
     run("decrypt_slot (ciphertext)", 20_000 * scale, |class| {
         select(&mut work_ct, &fixed_ct_bytes, &random_cts[next()], class);
-        let ct = deserialize_slot(&work_ct).expect("valid ciphertext");
-        ticks(|| decrypt_slot(ctx, &sk, &ct))
+        let ct = CiphertextSlot::from_bytes(&work_ct).expect("valid ciphertext");
+        ticks(|| decrypt_slot(&sk, &ct, reject))
+    });
+
+    println!("\nFailed decryption (a payload that is rejected vs. a slot that holds none):");
+    run("decrypt_slot (failure)", 20_000 * scale, |class| {
+        select(&mut work_ct, &fixed_ct_bytes, &invalid_ct_bytes, class);
+        let ct = CiphertextSlot::from_bytes(&work_ct).expect("valid ciphertext");
+        ticks(|| decrypt_slot(&sk, &ct, reject))
     });
 
     println!(

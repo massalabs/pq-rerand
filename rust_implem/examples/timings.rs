@@ -8,14 +8,10 @@
 //! Reports median wall-clock timings for single-slot and 1024-slot batch
 //! operations, both single-threaded and multi-threaded (rayon).
 
-use pq_rerand::params::NUM_SLOTS;
-use pq_rerand::poly::NTT_CONTEXT;
-use pq_rerand::keygen::keygen;
-use pq_rerand::encoding::{encode, Plaintext};
-use pq_rerand::encrypt::{encrypt_slot, Flooding};
-use pq_rerand::rerandomize::rerandomize_slot;
-use pq_rerand::decrypt::decrypt_slot;
-use pq_rerand::batch::{encrypt_batch, rerandomize_batch, decrypt_batch};
+use pq_rerand::params::{NUM_SLOTS, SLOT_BYTES};
+use pq_rerand::{decrypt_batch, decrypt_slot, encrypt_batch, encrypt_slot, keygen, rerandomize_batch, rerandomize_slot};
+use pq_rerand::Flooding;
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 fn median(mut v: Vec<Duration>) -> Duration {
@@ -35,57 +31,63 @@ fn time_n(iters: usize, mut f: impl FnMut()) -> Duration {
 
 fn ms(d: Duration) -> f64 { d.as_secs_f64() * 1e3 }
 
+/// Stands for the authenticated decryption of an application: it is handed the
+/// payload, of one slot or of a batch, and accepts it.
+fn open<P: ?Sized>(payload: &mut P) -> Option<()> {
+    black_box(payload);
+    Some(())
+}
+
 fn main() {
     let threads = rayon::current_num_threads();
-    let ctx = &NTT_CONTEXT;
     // Seeded from the operating system, as every generator given to this crate
     // must be.
     let mut rng = rand::rng();
-    let (sk, pk) = keygen(&mut rng, ctx);
+    let (sk, pk) = keygen(&mut rng);
 
-    let message = encode(&std::array::from_fn(|i| i as u8));
-    let messages: Vec<Plaintext> = (0..NUM_SLOTS).map(|s| encode(&std::array::from_fn(|i| (i + s) as u8))).collect();
+    let payload: [u8; SLOT_BYTES] = std::array::from_fn(|i| i as u8);
+    let payloads: Vec<[u8; SLOT_BYTES]> = (0..NUM_SLOTS).map(|s| std::array::from_fn(|i| (i + s) as u8)).collect();
 
     // Warm up (caches, rayon pool spin-up).
-    let ct0 = encrypt_slot(&mut rng, ctx, &pk, &message, Flooding::Standard);
-    let _ = decrypt_slot(ctx, &sk, &ct0);
-    let _ = encrypt_batch(&mut rng, ctx, &pk, &messages, Flooding::Standard);
+    let ct0 = encrypt_slot(&mut rng, &pk, &payload, Flooding::Standard);
+    let _ = decrypt_slot(&sk, &ct0, open);
+    let _ = encrypt_batch(&mut rng, &pk, &payloads, Flooding::Standard);
 
     // ---- Single-slot ----
     let enc = time_n(200, || {
-        let _ = encrypt_slot(&mut rng, ctx, &pk, &message, Flooding::Standard);
+        let _ = encrypt_slot(&mut rng, &pk, &payload, Flooding::Standard);
     });
-    let ct = encrypt_slot(&mut rng, ctx, &pk, &message, Flooding::Standard);
+    let ct = encrypt_slot(&mut rng, &pk, &payload, Flooding::Standard);
     let rer = time_n(400, || {
-        let _ = rerandomize_slot(&mut rng, ctx, &pk, &ct);
+        let _ = rerandomize_slot(&mut rng, &pk, &ct);
     });
     let dec = time_n(400, || {
-        let _ = decrypt_slot(ctx, &sk, &ct);
+        let _ = decrypt_slot(&sk, &ct, open);
     });
 
     // ---- Batch (B = 1024), single-threaded sequential ----
     let enc_seq = time_n(7, || {
-        let _: Vec<_> = messages.iter()
-            .map(|m| encrypt_slot(&mut rng, ctx, &pk, m, Flooding::Standard)).collect();
+        let _: Vec<_> = payloads.iter()
+            .map(|p| encrypt_slot(&mut rng, &pk, p, Flooding::Standard)).collect();
     });
-    let cts = encrypt_batch(&mut rng, ctx, &pk, &messages, Flooding::Standard);
+    let cts = encrypt_batch(&mut rng, &pk, &payloads, Flooding::Standard);
     let rer_seq = time_n(7, || {
         let _: Vec<_> = cts.iter()
-            .map(|c| rerandomize_slot(&mut rng, ctx, &pk, c)).collect();
+            .map(|c| rerandomize_slot(&mut rng, &pk, c)).collect();
     });
     let dec_seq = time_n(7, || {
-        let _: Vec<_> = cts.iter().map(|c| decrypt_slot(ctx, &sk, c)).collect();
+        let _: Vec<_> = cts.iter().map(|c| decrypt_slot(&sk, c, open)).collect();
     });
 
     // ---- Batch (B = 1024), multi-threaded (rayon) ----
     let enc_par = time_n(7, || {
-        let _ = encrypt_batch(&mut rng, ctx, &pk, &messages, Flooding::Standard);
+        let _ = encrypt_batch(&mut rng, &pk, &payloads, Flooding::Standard);
     });
     let rer_par = time_n(7, || {
-        let _ = rerandomize_batch(&mut rng, ctx, &pk, &cts);
+        let _ = rerandomize_batch(&mut rng, &pk, &cts);
     });
     let dec_par = time_n(7, || {
-        let _ = decrypt_batch(ctx, &sk, &cts);
+        let _ = decrypt_batch(&sk, &cts, open);
     });
 
     println!("threads (rayon)        : {threads}");

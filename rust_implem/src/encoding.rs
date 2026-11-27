@@ -2,7 +2,7 @@
 
 use crate::params::{N, BITS_PER_COEFF, SLOT_BYTES};
 use crate::poly::{Secret, secret};
-use zeroize::Zeroizing;
+use core::hint::black_box;
 
 const MASK: u64 = (1u64 << BITS_PER_COEFF) - 1;
 // `decode` writes the slot out in 32-bit words.
@@ -14,7 +14,7 @@ const _: () = assert!((N * BITS_PER_COEFF).is_multiple_of(32));
 /// below `t`: one of 2^31 or more shows that the ciphertext did not decrypt to an
 /// encoded payload, which [`decode`] reports. The coefficients live on the heap
 /// and are zeroized on drop.
-pub struct Plaintext(pub(crate) Secret);
+pub(crate) struct Plaintext(pub(crate) Secret);
 
 /// Position of coefficient `i` in the byte stream: the offset of an 8-byte window
 /// and the shift of the coefficient inside it. The window of the last coefficient
@@ -34,7 +34,7 @@ fn window(i: usize) -> (usize, usize) {
 /// (~31× fewer memory operations than a bit-by-bit loop). The memory-access
 /// pattern depends only on the coefficient index, never on the (secret)
 /// plaintext content.
-pub fn encode(data: &[u8; SLOT_BYTES]) -> Plaintext {
+pub(crate) fn encode(data: &[u8; SLOT_BYTES]) -> Plaintext {
     let mut coeffs = secret();
     for (i, c) in coeffs.iter_mut().enumerate() {
         let (byte, shift) = window(i);
@@ -44,23 +44,27 @@ pub fn encode(data: &[u8; SLOT_BYTES]) -> Plaintext {
     Plaintext(coeffs)
 }
 
-/// Decode a plaintext slot back into SLOT_BYTES = 15,872 bytes. Inverse of
-/// [`encode`]. The bytes are zeroized on drop.
+/// Decode a plaintext slot back into the SLOT_BYTES = 15,872 bytes of `bytes`.
+/// Inverse of [`encode`].
 ///
-/// Returns `None` if a coefficient is 2^31 or more, which no encoded slot contains:
-/// the ciphertext did not decrypt to a payload (wrong key, modified ciphertext,
-/// exhausted noise budget). The whole slot is scanned before the verdict, in
-/// constant time. Treat `None` exactly like a failed authentication of the
-/// payload, and do not let anyone who can submit ciphertexts tell the two apart
-/// (not even by timing): the difference would reveal comparisons on secret values.
-pub fn decode(plaintext: &Plaintext) -> Option<Zeroizing<Vec<u8>>> {
-    let mut bytes = Zeroizing::new(vec![0u8; SLOT_BYTES]);
-    let mut seen = 0u32;
+/// Returns `false` if a coefficient is 2^31 or more, which no encoded slot
+/// contains: the ciphertext did not decrypt to a payload (wrong key, modified
+/// ciphertext, exhausted noise budget). `bytes` is then all zero: nothing of
+/// what an invalid slot decrypted to is written out. The whole slot is scanned
+/// and written whatever the verdict, which only masks the coefficients:
+/// constant time.
+pub(crate) fn decode(plaintext: &Plaintext, bytes: &mut [u8; SLOT_BYTES]) -> bool {
+    let seen = plaintext.0.iter().fold(0, |seen, &c| seen | c);
+    let valid = seen >> BITS_PER_COEFF == 0;
+    // What is kept of every coefficient: its 31 bits if the slot is valid, nothing
+    // if not. The mask goes through `black_box`: a compiler that knows it to be
+    // one of these two values can branch on the verdict and write the zeros with
+    // a `memset`.
+    let keep = black_box(MASK & (valid as u64).wrapping_neg());
     // Bits wait in `acc` until 32 of them can be written out at `at`.
     let (mut acc, mut pending, mut at) = (0u64, 0, 0);
     for &c in plaintext.0.iter() {
-        seen |= c;
-        acc |= (c as u64 & MASK) << pending;
+        acc |= (c as u64 & keep) << pending;
         pending += BITS_PER_COEFF;
         if pending >= 32 {
             bytes[at..at + 4].copy_from_slice(&(acc as u32).to_le_bytes());
@@ -69,7 +73,7 @@ pub fn decode(plaintext: &Plaintext) -> Option<Zeroizing<Vec<u8>>> {
             at += 4;
         }
     }
-    (seen >> BITS_PER_COEFF == 0).then_some(bytes)
+    valid
 }
 
 #[cfg(test)]
@@ -80,11 +84,19 @@ mod tests {
         std::array::from_fn(|i| ((i * mul + add) % 256) as u8)
     }
 
+    /// The bytes that `plaintext` decodes to, if it is valid.
+    fn decoded(plaintext: &Plaintext) -> Option<[u8; SLOT_BYTES]> {
+        // Decoding overwrites every byte, with zeros for an invalid slot.
+        let mut bytes = [0x77; SLOT_BYTES];
+        let valid = decode(plaintext, &mut bytes);
+        assert!(valid || bytes == [0; SLOT_BYTES], "an invalid slot left bytes behind");
+        valid.then_some(bytes)
+    }
+
     #[test]
     fn test_encode_decode_roundtrip() {
         for data in [pattern(1, 0), pattern(131, 17), [0u8; SLOT_BYTES], [0xFF; SLOT_BYTES]] {
-            let decoded = decode(&encode(&data)).expect("an encoded slot must decode");
-            assert_eq!(data[..], decoded[..], "encode/decode roundtrip failed");
+            assert_eq!(decoded(&encode(&data)), Some(data), "encode/decode roundtrip failed");
         }
     }
 
@@ -138,18 +150,18 @@ mod tests {
             for extra in [1u32 << 31, u32::MAX] {
                 let mut m = encode(&data);
                 m.0[i] |= extra;
-                assert!(decode(&m).is_none(), "coefficient {i} accepted");
+                assert!(decoded(&m).is_none(), "coefficient {i} accepted");
             }
         }
         // Exactly 2^31, alone in a zero slot: the smallest value that is rejected.
         for i in [0, N - 1] {
             let mut m = Plaintext(secret());
             m.0[i] = 1 << 31;
-            assert!(decode(&m).is_none(), "coefficient {i} = 2^31 accepted");
+            assert!(decoded(&m).is_none(), "coefficient {i} = 2^31 accepted");
         }
         // The largest canonical value is accepted everywhere.
         let mut largest = Plaintext(secret());
         largest.0.fill((1 << 31) - 1);
-        assert!(decode(&largest).is_some());
+        assert_eq!(decoded(&largest), Some([0xFF; SLOT_BYTES]));
     }
 }

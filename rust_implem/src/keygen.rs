@@ -245,11 +245,12 @@ impl PublicKey {
 /// adding `e` overwrites it.
 ///
 /// The generator is read in a fixed order (`a mod t`, `a mod q2`, both drawn again
-/// while `a` has a zero NTT coefficient, then `s`, `e`; see
-/// [`crate::sampling`]), so the key pair is a deterministic function of the
-/// generator stream: a seeded generator with a specified algorithm, such as
+/// while `a` has a zero NTT coefficient, then `s`, `e`), in words of 32 bits for
+/// `a` and of 64 bits for `s` and `e`, so the key pair is a deterministic function
+/// of the generator stream: a seeded generator with a specified algorithm, such as
 /// ChaCha20, derives the same key pair on every platform.
-pub fn keygen<R: Rng + CryptoRng>(rng: &mut R, ctx: &NttContext) -> (SecretKey, PublicKey) {
+pub fn keygen<R: Rng + CryptoRng>(rng: &mut R) -> (SecretKey, PublicKey) {
+    let ctx = &NTT_CONTEXT;
     let mut sk = SecretKey::zeroed();
     let mut pk = PublicKey::zeroed();
     // a is uniform per modulus, among the invertible elements: it is drawn again
@@ -299,7 +300,7 @@ mod tests {
 
     fn test_keypair() -> (SecretKey, PublicKey) {
         let mut rng = StdRng::seed_from_u64(42);
-        keygen(&mut rng, &NTT_CONTEXT)
+        keygen(&mut rng)
     }
 
     /// Replace one coefficient of a serialized limb (the limbs follow the
@@ -467,8 +468,8 @@ mod tests {
     #[test]
     fn verify_against_accepts_only_the_matching_key() {
         let mut rng = StdRng::seed_from_u64(13);
-        let (sk, pk) = keygen(&mut rng, &NTT_CONTEXT);
-        let (other_sk, other_pk) = keygen(&mut rng, &NTT_CONTEXT);
+        let (sk, pk) = keygen(&mut rng);
+        let (other_sk, other_pk) = keygen(&mut rng);
         assert!(pk.verify_against(&sk));
         assert!(other_pk.verify_against(&other_sk));
         assert!(!other_pk.verify_against(&sk), "foreign key accepted");
@@ -552,13 +553,13 @@ mod tests {
     fn keygen_discards_non_invertible_a() {
         for prefix in [[0, 0], [0, 1], [1, 0]] {
             let mut rng = Prefixed { prefix, drawn: 0, inner: StdRng::seed_from_u64(77) };
-            let (sk, pk) = keygen(&mut rng, &NTT_CONTEXT);
+            let (sk, pk) = keygen(&mut rng);
             assert!(pk.a_is_invertible());
             assert!(pk.verify_against(&sk));
             assert!(PublicKey::from_bytes(&pk.to_bytes()).is_some());
 
             // Same key as a run on the generator alone.
-            let (sk2, pk2) = keygen(&mut StdRng::seed_from_u64(77), &NTT_CONTEXT);
+            let (sk2, pk2) = keygen(&mut StdRng::seed_from_u64(77));
             assert_eq!(pk.to_bytes(), pk2.to_bytes());
             assert_eq!(sk.to_bytes(), sk2.to_bytes());
         }
@@ -570,7 +571,7 @@ mod tests {
     fn keygen_output_is_well_formed() {
         for seed in 0..4 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let (sk, pk) = keygen(&mut rng, &NTT_CONTEXT);
+            let (sk, pk) = keygen(&mut rng);
             assert!(is_small(&sk.s_t, &sk.s_q2));
             assert!(sk.s_t.iter().any(|&x| x != 0), "s = 0");
             assert!(PublicKey::from_bytes(&pk.to_bytes()).is_some());

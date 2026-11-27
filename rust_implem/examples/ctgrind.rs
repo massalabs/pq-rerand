@@ -11,8 +11,11 @@
 //! generator stay defined: they only produce the public polynomial `a`.
 //!
 //! Each operation is checked against the number of reports it may cause: none,
-//! or one to four jumps for the two that end in a verdict on secret data
-//! (`SecretKey::from_bytes` and `decode` say whether their input is well formed).
+//! or one to four jumps for those that end in a verdict on secret data
+//! (`SecretKey::from_bytes` says whether its input is well formed, and a
+//! decryption whose payload was accepted whether the slots held one). A
+//! decryption that fails causes none: it ends the same way whether a slot held
+//! no payload or `open` rejected it.
 //! A control that branches on a secret must be reported, which shows that the
 //! tool sees the secrets on this target.
 //!
@@ -26,18 +29,22 @@
 //! every jump and address, but not instructions whose latency depends on their
 //! operands.
 
-use pq_rerand::batch::{decrypt_batch, encrypt_batch, rerandomize_batch};
-use pq_rerand::decrypt::decrypt_slot;
-use pq_rerand::encoding::{decode, encode};
-use pq_rerand::encrypt::{encrypt_slot, Flooding};
-use pq_rerand::keygen::{keygen, SecretKey};
-use pq_rerand::params::{N, SLOT_BYTES};
-use pq_rerand::poly::NTT_CONTEXT;
-use pq_rerand::rerandomize::rerandomize_slot;
-use pq_rerand::sampling::{add_flood, sample_gaussian_cdt};
+// The samplers of the library, compiled into this program as well, to run them
+// on their own.
+#[allow(dead_code)]
+#[path = "../src/sampling.rs"]
+mod sampling;
+mod params {
+    pub use pq_rerand::params::*;
+}
+
+use pq_rerand::params::{DELTA_T, N, SLOT_BYTES, T};
+use pq_rerand::{decrypt_batch, decrypt_slot, encrypt_batch, encrypt_slot, keygen, rerandomize_batch, rerandomize_slot};
+use pq_rerand::{CiphertextSlot, Flooding, SecretKey};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng, TryCryptoRng, TryRng};
 use std::convert::Infallible;
+use sampling::{add_flood, sample_gaussian_cdt};
 use std::hint::black_box;
 
 /// A Valgrind client request: a no-op that returns 0 outside Valgrind.
@@ -154,14 +161,22 @@ fn branchy_sum(values: &[i32; N]) -> i32 {
     acc
 }
 
-/// The two functions that end in a verdict on secret data branch on it: a few
-/// jumps at most, against thousands for a scan that stops at the first bad value.
+/// Stands for the authenticated decryption of an application. Its answer is only
+/// known at run time and comes back in memory, as a key or a buffer would: what
+/// a decryption does after `open` stays in the program that is checked.
+#[inline(never)]
+fn open<P: ?Sized>(payload: &mut P, accept: bool) -> Option<[u8; 32]> {
+    black_box(payload);
+    accept.then_some([0; 32])
+}
+
+/// The functions that end in a verdict on secret data branch on it: a few jumps
+/// at most, against thousands for a scan that stops at the first bad value.
 const VERDICT: std::ops::RangeInclusive<usize> = 1..=4;
 const NONE: std::ops::RangeInclusive<usize> = 0..=0;
 
 fn main() {
     let on_valgrind = client_request(RUNNING_ON_VALGRIND, 0, 0) != 0;
-    let ctx = &NTT_CONTEXT;
     let mut rng = Tainted(StdRng::seed_from_u64(1));
     let mut failures = 0;
     let f = &mut failures;
@@ -171,7 +186,7 @@ fn main() {
     check(f, "control: secret branch", N / 4..=usize::MAX, || black_box(branchy_sum(&samples)));
     check(f, "flood sampler", NONE, || add_flood(&mut rng, &mut samples));
 
-    let (sk, pk) = check(f, "keygen", NONE, || keygen(&mut rng, ctx));
+    let (sk, pk) = check(f, "keygen", NONE, || keygen(&mut rng));
     let mut matches = check(f, "PublicKey::verify_against", NONE, || pk.verify_against(&sk));
     public(&mut matches);
     assert!(matches);
@@ -181,22 +196,42 @@ fn main() {
 
     let mut data = [0x5au8; SLOT_BYTES];
     secret(&mut data);
-    let message = check(f, "encode", NONE, || encode(&data));
-    let ct = check(f, "encrypt_slot", NONE, || encrypt_slot(&mut rng, ctx, &pk, &message, Flooding::Standard));
+    let ct = check(f, "encrypt_slot", NONE, || encrypt_slot(&mut rng, &pk, &data, Flooding::Standard));
     // Kept until the end, like the other results: memory that is freed while
     // marked is handed out again with its marks.
-    let _unflooded = check(f, "encrypt_slot (no flood)", NONE, || encrypt_slot(&mut rng, ctx, &pk, &message, Flooding::Off));
-    let ct2 = check(f, "rerandomize_slot", NONE, || rerandomize_slot(&mut rng, ctx, &pk, &ct));
-    let recovered = check(f, "decrypt_slot", NONE, || decrypt_slot(ctx, &sk, &ct2));
-    let mut decoded = check(f, "decode", VERDICT, || decode(&recovered)).expect("decryption failed");
-    public(&mut decoded[..]);
-    assert!(decoded.iter().all(|&b| b == 0x5a));
+    let _unflooded = check(f, "encrypt_slot (no flood)", NONE, || encrypt_slot(&mut rng, &pk, &data, Flooding::Off));
+    let ct2 = check(f, "rerandomize_slot", NONE, || rerandomize_slot(&mut rng, &pk, &ct));
+    // The same slot with the first coefficient of its message raised from
+    // 0x5a5a5a5a to 2^31, by adding Delta_t times the difference to the first word
+    // of c0: it does not decrypt to a payload. A modified ciphertext is public.
+    let mut bytes = ct2.to_bytes();
+    public(&mut bytes[..]);
+    let c0 = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64;
+    let shift = DELTA_T as u64 * ((1 << 31) - 0x5a5a_5a5a) % T as u64;
+    bytes[..4].copy_from_slice(&(((c0 + shift) % T as u64) as u32).to_le_bytes());
+    let invalid = CiphertextSlot::from_bytes(&bytes).expect("reduced");
+    let mut no_payload = decrypt_slot(&sk, &invalid, |_| Some(())).is_none();
+    public(&mut no_payload);
+    assert!(no_payload);
+    // A decryption that fails, because `open` rejects the payload or because the
+    // slot holds none, causes no report. Its result is used, like the answer of
+    // `open`: the comparison with the verdict stays in the program.
+    let reject = black_box(false);
+    check(f, "decrypt_slot (rejected)", NONE, || black_box(decrypt_slot(&sk, &ct2, |p| open(p, reject))));
+    check(f, "decrypt_slot (no payload)", NONE, || black_box(decrypt_slot(&sk, &invalid, |p| open(p, reject))));
+    let accepted = || decrypt_slot(&sk, &ct2, |payload| Some(*payload)).expect("decryption failed");
+    let mut decrypted = check(f, "decrypt_slot", VERDICT, accepted);
+    public(&mut decrypted);
+    assert!(decrypted.iter().all(|&b| b == 0x5a));
 
-    let messages = [encode(&data), encode(&data), encode(&data)];
-    let cts = check(f, "encrypt_batch", NONE, || encrypt_batch(&mut rng, ctx, &pk, &messages, Flooding::Standard));
-    let cts2 = check(f, "rerandomize_batch", NONE, || rerandomize_batch(&mut rng, ctx, &pk, &cts));
-    let recovered = check(f, "decrypt_batch", NONE, || decrypt_batch(ctx, &sk, &cts2));
-    assert_eq!(recovered.len(), messages.len());
+    let payloads = [data; 3];
+    let cts = check(f, "encrypt_batch", NONE, || encrypt_batch(&mut rng, &pk, &payloads, Flooding::Standard));
+    let cts2 = check(f, "rerandomize_batch", NONE, || rerandomize_batch(&mut rng, &pk, &cts));
+    let mixed = [cts2[0].clone(), invalid.clone(), cts2[2].clone()];
+    check(f, "decrypt_batch (rejected)", NONE, || black_box(decrypt_batch(&sk, &cts2, |p| open(p, reject))));
+    check(f, "decrypt_batch (no payload)", NONE, || black_box(decrypt_batch(&sk, &mixed, |p| open(p, reject))));
+    let accepted = || decrypt_batch(&sk, &cts2, |payloads| Some(payloads.len())).expect("decryption failed");
+    assert_eq!(check(f, "decrypt_batch", VERDICT, accepted), payloads.len());
 
     if !on_valgrind {
         println!("\nNot running under Valgrind: nothing was checked.");

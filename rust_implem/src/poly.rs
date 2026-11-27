@@ -102,7 +102,7 @@ pub(crate) fn is_small(t: &[u32; N], q2: &[u32; N]) -> bool {
 }
 
 /// Precomputed NTT context holding tables for both primes.
-pub struct NttContext {
+pub(crate) struct NttContext {
     /// Tables for the plaintext-limb prime `t`.
     pub(crate) tables_t: NttTables,
     /// Tables for the noise-limb prime `q₂`.
@@ -111,21 +111,11 @@ pub struct NttContext {
 
 /// Shared NTT context (twiddle tables for both primes). `NttContext::new` is a
 /// `const fn`, so this static is built at compile time (no runtime table setup).
-/// Pass a reference to it wherever a context is needed.
-pub static NTT_CONTEXT: NttContext = NttContext::new();
-
-impl Default for NttContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub(crate) static NTT_CONTEXT: NttContext = NttContext::new();
 
 impl NttContext {
-    /// Build the context (const-evaluable; see [`NTT_CONTEXT`]).
-    ///
-    /// Prefer the static: building a context at run time takes about 300 KiB of
-    /// stack, twice that without optimizations.
-    pub const fn new() -> Self {
+    /// Build the context, at compile time (see [`NTT_CONTEXT`]).
+    const fn new() -> Self {
         NttContext {
             tables_t: NttTables::new(T),
             tables_q2: NttTables::new(Q2),
