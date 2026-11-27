@@ -320,10 +320,16 @@ mod tests {
     /// fixed-point integer arithmetic with 100 fractional bits. The accumulated
     /// truncation error is below 2^-90, far less than the distance (0.0065 units of
     /// 2^-63) between any exact probability and the nearest rounding boundary.
+    ///
+    /// The weights `exp(-k^2 / (2 sigma^2))` are powers of `exp(-1 / (2 sigma^2))`,
+    /// which is evaluated by its Taylor series. `tools/lean/cdt_table.lean` builds the
+    /// same table in another way (512 fractional bits, one exponential per magnitude),
+    /// then checks its tails and measures its distance from the discrete Gaussian.
     #[test]
     fn cdt_matches_exact_distribution() {
         const ONE: u128 = 1 << 100;
-        // floor(a * b / 2^100), for a, b <= 2^100.
+        // floor(a * b / 2^100), for a, b <= 2^100. The product may not fit in a u128:
+        // from the 64-bit halves, it is ah*bh*2^128 + (ah*bl + al*bh)*2^64 + al*bl.
         fn mul(a: u128, b: u128) -> u128 {
             const LOW: u128 = (1 << 64) - 1;
             let (ah, al, bh, bl) = (a >> 64, a & LOW, b >> 64, b & LOW);
@@ -331,13 +337,16 @@ mod tests {
         }
         // rho(k) = exp(-k^2 / (2 sigma^2)) = q^(k^2), with q = exp(-25/512).
         assert!((2.0 * SIGMA * SIGMA - 512.0 / 25.0).abs() < 1e-12);
+        // Taylor series: q = 1 - x + x^2/2! - x^3/3! + ... at x = 25/512, where `term`
+        // is x^n / n!. It falls below 2^-100 at n = 15: the later terms add nothing.
         let (mut term, mut q) = (ONE, ONE);
         for n in 1..40u128 {
             term = term * 25 / (512 * n);
             q = if n % 2 == 1 { q - term } else { q + term };
         }
-        // Folded weights: w(0) = rho(0), w(k) = 2 rho(k).
-        // rho(k) = rho(k-1) * q^(2k-1). Beyond k = 47 the weights are below 2^-160.
+        // Folded weights: w(0) = rho(0), w(k) = 2 rho(k) for k and -k.
+        // rho(k) = rho(k-1) * q^(2k-1), since k^2 - (k-1)^2 = 2k - 1: `step` is that
+        // power of q. Beyond k = 47 the weights are below 2^-160.
         let q2 = mul(q, q);
         let (mut rho, mut step) = (ONE, q);
         let mut weights = vec![ONE];
@@ -346,8 +355,10 @@ mod tests {
             step = mul(step, q2);
             weights.push(2 * rho);
         }
+        // The probability of a magnitude is its weight over the sum of the weights.
         let norm: u128 = weights.iter().sum();
-        // round(2^63 * w / norm), from the quotient with one more bit.
+        // round(2^63 * w / norm), from the quotient with one more bit: the long
+        // division gives floor(2^64 * w / norm), 16 bits at a time.
         let rounded = |w: u128| {
             let (mut rem, mut quo) = (w, 0u128);
             for _ in 0..4 {
@@ -357,8 +368,10 @@ mod tests {
             }
             (quo + 1) >> 1
         };
-        // Probabilities of the magnitudes 1, 2, ...: zero takes what remains.
+        // Probabilities of the magnitudes 1, 2, ..., in units of 2^-63: zero takes
+        // what remains.
         let probabilities: Vec<u128> = weights[1..].iter().map(|&w| rounded(w)).collect();
+        // The thresholds are the cumulative sums: the first is the probability of zero.
         let mut threshold = (1 << 63) - probabilities.iter().sum::<u128>();
         for (k, &entry) in CDT.iter().enumerate() {
             assert_eq!(entry as u128, threshold, "CDT[{k}]");
