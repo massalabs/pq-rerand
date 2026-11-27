@@ -108,14 +108,18 @@ jobs:
       # The taint check does not run under emulation. Instead: the code of the
       # crate must not call a rounding, conversion or division routine of the
       # run-time libraries (round, __aeabi_d2lz, ...), which branch on their
-      # operand, and the flood sampler must call nothing but memset. The example
-      # compiles two source files of the crate itself, and identical functions
-      # are merged: the library can run its samplers under either name.
+      # operand, and the flood sampler must call nothing but memset. Most
+      # floating-point operations are instructions on this target, not calls,
+      # and their names carry the type (vmul.f64, vcvt.s32.f64, ...): the code
+      # of the crate must not contain one either. The example compiles two
+      # source files of the crate itself, and identical functions are merged:
+      # the library can run its samplers under either name.
       - run: |
           arm-linux-gnueabihf-objdump -dC target/$TARGET/release/examples/residue | awk '
             />:$/ { crate = /pq_rerand::|residue::(sampling|ntt)::/; flood = /sampling::.*add_flood/; seen += flood }
             crate && /<_*(round|trunc|floor|sqrt|__aeabi_[dfilu][0-9a-z_]*|__u?(div|mod|divmod)[sd]i[34])(@plt)?>$/ { print; bad = 1 }
             flood && /<[^:<>+]+>$/ && !/<memset(@plt)?>$/ { print; bad = 1 }
+            crate && /\tv[a-z0-9.]*\.f[136]/ { print; bad = 1 }
             END { exit bad || !seen }'
 
   table:
