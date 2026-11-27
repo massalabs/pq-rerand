@@ -140,9 +140,11 @@ impl Scanner {
         // Window -> (needle, index of the window in the needle).
         let mut windows: HashMap<&[u8], (usize, usize)> = HashMap::new();
         for (n, needle) in self.needles.iter().enumerate() {
-            // Windows of 8 bytes start at every word, the others follow one another.
+            // Windows of 8 bytes start at every word, the others follow one another,
+            // from the first whole word: after the version byte of a serialized key.
             let step = if needle.window == 8 { WORD } else { needle.window };
-            for (i, window) in self.arena[needle.bytes.clone()].windows(needle.window).step_by(step).enumerate() {
+            let bytes = &self.arena[needle.bytes.clone()];
+            for (i, window) in bytes[bytes.len() % WORD..].windows(needle.window).step_by(step).enumerate() {
                 let words: HashSet<_> = window.as_chunks::<WORD>().0.iter().filter(|w| **w != [0; WORD]).collect();
                 if needle.window < 16 || words.len() >= 3 {
                     windows.insert(window, (n, i));
@@ -252,10 +254,11 @@ fn zeros<T: Copy + Default + Zeroize>() -> Box<Zeroizing<[T; N]>> {
     Box::new(Zeroizing::new([T::default(); N]))
 }
 
-/// The `i`-th array of `N` little-endian words in `bytes`.
+/// The `i`-th array of `N` little-endian words in `bytes`, after the version
+/// byte if `bytes` is a serialized key.
 fn limb(bytes: &[u8], i: usize) -> Box<Zeroizing<[u32; N]>> {
     let mut limb = zeros();
-    let words = bytes[4 * N * i..].as_chunks::<WORD>().0;
+    let words = bytes[bytes.len() % WORD + 4 * N * i..].as_chunks::<WORD>().0;
     limb.iter_mut().zip(words).for_each(|(coefficient, word)| *coefficient = u32::from_le_bytes(*word));
     limb
 }

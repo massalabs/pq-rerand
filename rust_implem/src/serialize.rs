@@ -4,8 +4,11 @@
 //! Each coefficient is a little-endian u32 (4 bytes).
 //! Total per slot: 4 × 4096 × 4 = 65,536 bytes = 64 KiB.
 //!
-//! The format carries no version or parameter tag (neither do serialized keys):
-//! a container that may outlive this parameter set must record one itself.
+//! A slot carries no version byte: it has the format of the key it was made
+//! with, and a serialized key starts with
+//! [`FORMAT_VERSION`](crate::params::FORMAT_VERSION). Nothing in a slot names
+//! that key or its format: a container that keeps slots apart from their key
+//! must record the version itself.
 
 use crate::params::{N, T, Q2};
 use crate::encrypt::CiphertextSlot;
