@@ -4,11 +4,11 @@
 pub const N: usize = 4096;
 
 /// Plaintext modulus. Prime, ≡ 1 (mod 8192). Fits in u32.
-/// t = 262143 * 8192 + 1 = 2_147_565_569
+/// t = 262154 * 8192 + 1 = 2_147_565_569
 pub const T: u32 = 2_147_565_569;
 
 /// Second CRT prime (noise-limb modulus). Prime, ≡ 1 (mod 8192). Fits in u32.
-/// q2 = 524413 * 8192 + 1 = 4_294_828_033
+/// q2 = 524271 * 8192 + 1 = 4_294_828_033
 pub const Q2: u32 = 4_294_828_033;
 
 /// Scaling factor residue: Δ_t = q₂ mod t. The message embedding in the t-limb
@@ -31,24 +31,27 @@ pub const SIGMA: f64 = 3.2;
 pub const KAPPA_F: u64 = 858_000_000;
 
 /// Flood Gaussian standard deviation σ_f = σ · √κ_f ≈ 93,733 (paper §6).
-/// 3.2 · √858_000_000 = 3.2 · 29291.6368… = 93733.236…
-pub const SIGMA_FLOOD: f64 = 93_733.236;
+/// 3.2 * sqrt(858_000_000) = 3.2 * 29291.6370... = 93733.2385...
+pub const SIGMA_FLOOD: f64 = 93_733.238_501_611_59;
 
 /// Noise-budget threshold: a coefficient decrypts correctly iff |ν| < q₂/2
 /// (paper Theorem 4.3). With q₂ ≈ 2³², q₂/2 ≈ 2.147 × 10⁹.
 pub const NOISE_THRESHOLD: u32 = Q2 / 2;
 
-/// Maximum *additional* public re-randomizations on top of the flood baseline
-/// guaranteed by the fixed-key batch bound (paper Remark 4.7 / Table 6,
-/// p_batch = 2⁻¹⁰⁶, B = 1024): k_max ≈ 1.4 × 10¹⁰. Documented for reference;
-/// the analytic bound itself lives in `tools/`.
+/// Conservative limit on the number of *additional* public re-randomizations of
+/// one ciphertext on top of the flood baseline. The fixed-key batch bound (paper
+/// Theorem 4.6, Remark 4.7 and Table 7; p_batch = 2^-106, B = 1024, good key)
+/// gives k_max = 14,151,421,672 with flooding and 15,009,421,672 without; this
+/// constant rounds the former down. Nothing in this crate counts
+/// re-randomizations: see [`rerandomize_slot`](crate::rerandomize::rerandomize_slot).
 pub const K_MAX_RERAND: u64 = 14_000_000_000;
 
 /// Number of slots for 15.5 MiB plaintext.
 pub const NUM_SLOTS: usize = 1024;
 
-/// Bytes of plaintext per slot (4096 coefficients × 31 bits / 8).
-pub const SLOT_BYTES: usize = N * 31 / 8; // 15_872
+/// Bytes of plaintext per slot (N coefficients of BITS_PER_COEFF bits each).
+pub const SLOT_BYTES: usize = N * BITS_PER_COEFF / 8; // 15_872
+const _: () = assert!((N * BITS_PER_COEFF).is_multiple_of(8), "a slot must hold whole bytes");
 
 /// Total plaintext capacity in bytes.
 pub const PLAINTEXT_BYTES: usize = NUM_SLOTS * SLOT_BYTES; // 16_252_928
@@ -89,7 +92,7 @@ mod tests {
         // σ_f must equal σ·√κ_f to match the paper's flood calibration.
         let expected = SIGMA * (KAPPA_F as f64).sqrt();
         let diff = (SIGMA_FLOOD - expected).abs();
-        assert!(diff < 0.5, "SIGMA_FLOOD is off: {} vs {}", SIGMA_FLOOD, expected);
+        assert!(diff < 1e-6, "SIGMA_FLOOD is off: {} vs {}", SIGMA_FLOOD, expected);
     }
 
     #[test]

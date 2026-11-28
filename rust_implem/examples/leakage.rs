@@ -1,66 +1,73 @@
 //! Constant-time / timing-leakage harness (TVLA / dudect-style).
 //!
-//! For each target we measure CPU-cycle counts (`rdtsc`) over two input classes
+//! For each target we measure timer ticks (`rdtsc`) over two input classes
 //! (fixed vs. random) and apply Welch's t-test, as in the dudect methodology
 //! [Reparaz–Balasch–Tunstall, DATE'17] and Goodwill et al.'s TVLA fixed-vs-random
 //! test. A small |t| (conventionally `|t| < 4.5`) means no input-dependent timing
-//! was detected; a large |t| flags leakage. We report the raw statistic and a
-//! version with the slow-outlier tail cropped (interrupts / migrations inflate it).
+//! was detected; a large |t| flags leakage. We report the raw statistic and
+//! versions with the slow-outlier tail cropped (interrupts / migrations inflate it).
 //!
-//! Targets (fixed-vs-random over the *data* input). To avoid a cache-locality
-//! confound, both classes stream through equally-sized pools (identical memory
-//! footprint and access pattern); only the data content differs. Following
-//! dudect convention, the "fixed" class is an arbitrary fixed *random* constant:
-//!   * `encrypt_slot` — fixed vs. random *plaintext* (tests message-dependence
-//!     of the encryption path).
-//!   * `rerandomize` — fixed- vs. random-plaintext *input ciphertexts* (public
-//!     path; tests operand-dependence).
-//!   * `decrypt_slot` — fixed- vs. random-plaintext ciphertexts; the
-//!     secret-dependent path exercising the whole branchless arithmetic layer
-//!     (Barrett reduction, csub/submod, center-lift).
-//!   * `leaky_reduce` — POSITIVE CONTROL: a branchy reduction that *should* be
-//!     flagged, proving the harness can detect leakage.
+//! The class of every measurement is drawn at random, so that drift (frequency
+//! scaling, temperature) cannot line up with a class, and the two classes only
+//! differ in the content of one input:
+//!   * the generator stream, for the samplers, key generation (with the public
+//!     polynomial `a` held fixed: its rejection sampling takes a time that depends
+//!     on `a`, which is public), encryption and re-randomization: the fixed class
+//!     always replays one stream, the random class a fresh one;
+//!   * the secret key, for decryption and for secret-key parsing;
+//!   * the plaintext, for encryption, and the ciphertext, for re-randomization
+//!     and decryption.
 //!
-//! Two additional diagnostics document a *hardware* (not software) effect:
-//!   * `encrypt (all-zero)` — all-zero vs. random plaintext. On some CPUs
-//!     (observed on Zen 4) this can be flagged at a ~0.02% timing difference
-//!     even though the code is branchless, because operating on all-zero data
-//!     costs marginally less energy/time at the silicon level (data-dependent
-//!     bit-toggle effects). The signal is at the edge of detectability at this
-//!     sample count and does not appear on every run.
-//!   * `hw zero-load (baseline)` — a pure load+XOR loop with *no* crypto
-//!     arithmetic over the same two pools. It is robustly flagged on such CPUs,
-//!     proving the all-zero signal originates in the hardware data path, not in
-//!     this crate's control flow or memory addressing.
+//! Whatever the class, the same work is done before a measurement and the
+//! operation runs on the same memory: an input that lives in memory is first
+//! assembled in one working buffer from a fixed value and a random one, which are
+//! both read in full and of which a mask keeps one. Only the content of that
+//! buffer differs between the classes: the memory that was accessed, and with it
+//! the state of the caches, does not depend on the class. (Inputs read from one
+//! memory pool per class already differ in timing by that fact alone, at a level
+//! that a few hundred thousand measurements detect.)
 //!
-//! In the intended deployment this degenerate-input channel is absent by
-//! construction: payloads are AEAD ciphertexts, which are indistinguishable
-//! from uniformly random bytes, so an all-zero (or otherwise low-entropy)
-//! plaintext never occurs.
+//! Two controls calibrate the harness: one gives both classes the same inputs
+//! and must not be flagged (false-positive check), the other runs a loop with one
+//! data-dependent branch per coefficient and must be flagged (sensitivity check).
+//!
+//! One more diagnostic looks for a hardware effect, not a software one:
+//! `flood sampler (chosen inputs)` runs the flood sampler on a few special inputs
+//! (both ends of its input range and the boundary between the two regions of its
+//! approximation) against random ones. The sampler computes in floating point,
+//! and on some CPUs the latency of a division or of a square root depends on the
+//! operands: a flag here means that it does on this one.
 //!
 //! (We test the full operations rather than micro-benchmarking individual modular
 //! primitives: a ~300-cycle primitive sits below reliable `rdtsc` resolution, where
 //! the t-test reflects measurement quantization rather than the operation.)
 //!
-//! Run with: `cargo run --release --example leakage`
-//! Results are statistical and machine-dependent; run multiple times under low load.
+//! Run with: `cargo run --release --example leakage [scale]`, where `scale`
+//! multiplies the number of measurements (default 1).
+//! Results are statistical and machine-dependent; run multiple times under low
+//! load, on every target the crate is deployed to. The timing of the flood sampler
+//! in particular rests on the floating-point division and square root of the CPU.
 
-use pq_rerand::params::{N, T, SIGMA_FLOOD, BITS_PER_COEFF};
-use pq_rerand::poly::NttContext;
-use pq_rerand::keygen::{keygen, SecretKey, PublicKey};
-use pq_rerand::encrypt::{encrypt_slot, CiphertextSlot};
+use pq_rerand::params::{N, T, SLOT_BYTES};
+use pq_rerand::poly::NTT_CONTEXT;
+use pq_rerand::keygen::{keygen, SecretKey};
+use pq_rerand::encoding::encode;
+use pq_rerand::encrypt::{encrypt_slot, Flooding};
 use pq_rerand::rerandomize::rerandomize_slot;
 use pq_rerand::decrypt::decrypt_slot;
-use rand::{Rng, SeedableRng};
+use pq_rerand::sampling::{add_flood, sample_gaussian_cdt};
+use pq_rerand::serialize::{deserialize_slot, serialize_slot};
+use rand::{Rng, SeedableRng, TryCryptoRng, TryRng};
 use rand::rngs::StdRng;
+use std::convert::Infallible;
 use std::hint::black_box;
 
 /// Read a high-resolution time-stamp counter.
 ///
 /// * x86_64: serialized `rdtsc`.
 /// * aarch64 (mobile / Apple silicon / ARM servers): the EL0-readable virtual
-///   counter `cntvct_el0` (coarser than `rdtsc`; increase sample counts if the
-///   t-test looks noisy).
+///   counter `cntvct_el0`, whose resolution depends on the platform (from one
+///   nanosecond to tens of them; increase the scale if the t-test looks noisy).
 /// * other targets: nanoseconds from a monotonic clock.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -93,6 +100,14 @@ fn rdtsc() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
+/// Ticks taken by one call of `f`.
+#[inline(always)]
+fn ticks<T>(f: impl FnOnce() -> T) -> f64 {
+    let start = rdtsc();
+    black_box(f());
+    rdtsc().wrapping_sub(start) as f64
+}
+
 fn mean_var(xs: &[f64]) -> (f64, f64) {
     let n = xs.len() as f64;
     let mean = xs.iter().sum::<f64>() / n;
@@ -119,224 +134,236 @@ fn cropped_t(c0: &[f64], c1: &[f64], keep: f64) -> f64 {
     welch_t(&a, &b)
 }
 
-fn report(name: &str, c0: &[f64], c1: &[f64]) {
-    let t_raw = welch_t(c0, c1).abs();
-    let t_c90 = cropped_t(c0, c1, 0.90).abs();
-    let t_c95 = cropped_t(c0, c1, 0.95).abs();
+/// Take `n` measurements of `measure(class)`, drawing the class of each one at
+/// random, and report the t-statistics between the two classes.
+fn run(name: &str, n: usize, mut measure: impl FnMut(usize) -> f64) {
+    let mut select = StdRng::seed_from_u64(0xC1A55);
+    let (mut c0, mut c1) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for _ in 0..n {
+        let class = (select.next_u32() & 1) as usize;
+        let t = measure(class);
+        if class == 0 { c0.push(t) } else { c1.push(t) }
+    }
+    let t_raw = welch_t(&c0, &c1).abs();
+    let t_c90 = cropped_t(&c0, &c1, 0.90).abs();
+    let t_c95 = cropped_t(&c0, &c1, 0.95).abs();
     let t = t_raw.max(t_c90).max(t_c95);
     let verdict = if t < 4.5 { "no leakage detected" } else { "LEAKAGE DETECTED" };
-    let (m0, _) = mean_var(c0);
-    let (m1, _) = mean_var(c1);
+    let (m0, _) = mean_var(&c0);
+    let (m1, _) = mean_var(&c1);
     println!(
-        "{name:<22} |t|_raw={t_raw:7.2}  |t|_crop90={t_c90:7.2}  |t|_crop95={t_c95:7.2}  \
-         mean0={m0:.0}c mean1={m1:.0}c  -> {verdict}",
+        "{name:<34} |t|_raw={t_raw:7.2}  |t|_crop90={t_c90:7.2}  |t|_crop95={t_c95:7.2}  \
+         mean0={m0:.0} mean1={m1:.0}  -> {verdict}",
     );
 }
 
-fn rand_message(rng: &mut StdRng) -> [u32; N] {
-    let mut m = [0u32; N];
-    for c in m.iter_mut() {
-        *c = rng.gen::<u32>() & ((1u32 << BITS_PER_COEFF) - 1);
-    }
-    m
+/// Generator that answers 32-bit draws from one stream and 64-bit draws from
+/// another. Key generation draws the public polynomial `a` in 32-bit words and
+/// its secrets in 64-bit words, so this holds `a` fixed while the secrets vary.
+struct Split {
+    words32: StdRng,
+    words64: StdRng,
 }
 
-/// POSITIVE CONTROL: data-dependent number of loop iterations -> variable time.
+impl TryRng for Split {
+    type Error = Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        Ok(self.words32.next_u32())
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        Ok(self.words64.next_u64())
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        self.words64.fill_bytes(dst);
+        Ok(())
+    }
+}
+
+// Only so that the type is accepted by the functions under test.
+impl TryCryptoRng for Split {}
+
+/// Generator whose 64-bit draws cycle through the `chosen` words where `mask` is
+/// all ones, and are random where it is zero. The same work is done in both cases.
+struct Chosen {
+    chosen: [u64; 4],
+    mask: u64,
+    random: StdRng,
+    count: usize,
+}
+
+impl TryRng for Chosen {
+    type Error = Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        Ok(self.random.next_u32())
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        self.count += 1;
+        let (chosen, random) = (self.chosen[self.count % 4], self.random.next_u64());
+        Ok((chosen & self.mask) | (random & !self.mask))
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        self.random.fill_bytes(dst);
+        Ok(())
+    }
+}
+
+impl TryCryptoRng for Chosen {}
+
+/// POSITIVE CONTROL: one data-dependent branch per coefficient, as a compiler
+/// could emit for a conditional subtraction -> variable time.
 #[inline(never)]
-fn leaky_reduce(mut x: u64) -> u64 {
-    let p = T as u64;
-    while x >= p {
-        x -= p;
-    }
-    x
-}
-
-const W: usize = 256;
-const POOL: usize = 512;
-
-/// Positive control: matched-pool driver with the branchy reducer whose
-/// iteration count depends on the operand value.
-fn leak_leaky(n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut rng = StdRng::seed_from_u64(0x1EA4);
-    let p = T as u64;
-    // class 0: values in [0, p) -> 0 loop iterations.
-    let pool0: Vec<[u64; W]> = (0..POOL).map(|_| [p / 2; W]).collect();
-    // class 1: values in [0, 64p) -> 0..64 iterations (data-dependent).
-    let pool1: Vec<[u64; W]> = (0..POOL)
-        .map(|_| { let mut b = [0u64; W]; b.iter_mut().for_each(|x| *x = rng.gen::<u64>() % (64 * p)); b })
-        .collect();
-    let run = |buf: &[u64; W]| -> f64 {
-        let s = rdtsc();
-        let mut acc = 0u64;
-        for &x in buf.iter() { acc ^= leaky_reduce(black_box(x)); }
-        black_box(acc);
-        (rdtsc() - s) as f64
-    };
-    let mut c0 = Vec::with_capacity(n);
-    let mut c1 = Vec::with_capacity(n);
-    for i in 0..n {
-        c0.push(run(&pool0[i % POOL]));
-        c1.push(run(&pool1[i % POOL]));
-    }
-    (c0, c1)
-}
-
-/// Measure `decrypt_slot` for fixed-plaintext vs. random-plaintext ciphertexts.
-///
-/// To avoid a cache-locality confound, *both* classes stream through equally-sized
-/// ciphertext pools (same memory footprint and access pattern); the only difference
-/// is the secret-dependent content (a fixed plaintext, each freshly re-encrypted with
-/// independent noise, vs. random plaintexts).
-fn leak_decrypt(
-    ctx: &NttContext,
-    sk: &SecretKey,
-    pk: &PublicKey,
-    n: usize,
-) -> (Vec<f64>, Vec<f64>) {
-    let mut rng = StdRng::seed_from_u64(0xDEC0);
-    let fixed_msg = rand_message(&mut rng); // arbitrary fixed constant (dudect)
-    let pool0: Vec<CiphertextSlot> = (0..POOL)
-        .map(|_| encrypt_slot(&mut rng, ctx, pk, &fixed_msg, SIGMA_FLOOD))
-        .collect();
-    let pool1: Vec<CiphertextSlot> = (0..POOL)
-        .map(|_| { let m = rand_message(&mut rng); encrypt_slot(&mut rng, ctx, pk, &m, SIGMA_FLOOD) })
-        .collect();
-    let run = |ct: &CiphertextSlot| -> f64 {
-        let s = rdtsc();
-        black_box(decrypt_slot(ctx, sk, black_box(ct)));
-        (rdtsc() - s) as f64
-    };
-    let mut c0 = Vec::with_capacity(n);
-    let mut c1 = Vec::with_capacity(n);
-    for i in 0..n {
-        c0.push(run(&pool0[i % POOL]));
-        c1.push(run(&pool1[i % POOL]));
-    }
-    (c0, c1)
-}
-
-/// Measure `encrypt_slot` for fixed vs. random plaintexts. Both classes stream
-/// through equally-sized message pools (matched footprint); only the content
-/// differs. Encryption noise is drawn from one shared RNG advanced identically
-/// across both classes, so its variance is unbiased. `fixed_msg` selects the
-/// fixed class: a fixed random constant (dudect convention) or the degenerate
-/// all-zero plaintext (hardware-effect diagnostic; see module docs).
-fn leak_encrypt(
-    ctx: &NttContext,
-    pk: &PublicKey,
-    n: usize,
-    fixed_msg: &[u32; N],
-) -> (Vec<f64>, Vec<f64>) {
-    let mut mrng = StdRng::seed_from_u64(0xE2C0);
-    let pool0: Vec<[u32; N]> = (0..POOL).map(|_| *fixed_msg).collect();
-    let pool1: Vec<[u32; N]> = (0..POOL).map(|_| rand_message(&mut mrng)).collect();
-    let mut erng = StdRng::seed_from_u64(0xE2C1);
-    let run = |msg: &[u32; N], r: &mut StdRng| -> f64 {
-        let s = rdtsc();
-        black_box(encrypt_slot(r, ctx, pk, black_box(msg), SIGMA_FLOOD));
-        (rdtsc() - s) as f64
-    };
-    let (mut c0, mut c1) = (Vec::with_capacity(n), Vec::with_capacity(n));
-    for i in 0..n {
-        c0.push(run(&pool0[i % POOL], &mut erng));
-        c1.push(run(&pool1[i % POOL], &mut erng));
-    }
-    (c0, c1)
-}
-
-/// Measure `rerandomize_slot` for fixed- vs. random-plaintext input ciphertexts.
-/// Both classes stream through equally-sized ciphertext pools (matched footprint);
-/// the re-randomization noise comes from one shared RNG advanced identically.
-fn leak_rerand(ctx: &NttContext, pk: &PublicKey, n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut erng = StdRng::seed_from_u64(0x4E4D);
-    let mut mrng = StdRng::seed_from_u64(0x4E4F);
-    let fixed_msg = rand_message(&mut mrng); // arbitrary fixed constant (dudect)
-    let pool0: Vec<CiphertextSlot> = (0..POOL)
-        .map(|_| encrypt_slot(&mut erng, ctx, pk, &fixed_msg, SIGMA_FLOOD))
-        .collect();
-    let pool1: Vec<CiphertextSlot> = (0..POOL)
-        .map(|_| { let m = rand_message(&mut erng); encrypt_slot(&mut erng, ctx, pk, &m, SIGMA_FLOOD) })
-        .collect();
-    let mut rrng = StdRng::seed_from_u64(0x4E4E);
-    let run = |ct: &CiphertextSlot, r: &mut StdRng| -> f64 {
-        let s = rdtsc();
-        black_box(rerandomize_slot(r, ctx, pk, black_box(ct)));
-        (rdtsc() - s) as f64
-    };
-    let (mut c0, mut c1) = (Vec::with_capacity(n), Vec::with_capacity(n));
-    for i in 0..n {
-        c0.push(run(&pool0[i % POOL], &mut rrng));
-        c1.push(run(&pool1[i % POOL], &mut rrng));
-    }
-    (c0, c1)
-}
-
-/// Hardware baseline: a pure streaming load+XOR over all-zero vs. random pools.
-/// Contains no crypto arithmetic at all; any flagged difference is a property of
-/// the CPU's data path (data-dependent bit-toggle energy/time), not of this crate.
-fn leak_hw_zero_load(n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut rng = StdRng::seed_from_u64(0x0B5E);
-    let pool0: Vec<[u32; N]> = (0..POOL).map(|_| [0u32; N]).collect();
-    let pool1: Vec<[u32; N]> = (0..POOL).map(|_| rand_message(&mut rng)).collect();
-    let run = |buf: &[u32; N]| -> f64 {
-        let s = rdtsc();
-        let mut acc = 0u32;
-        for _ in 0..8 {
-            for &x in buf.iter() {
-                acc ^= black_box(x);
-            }
+fn branchy_sum(buf: &[u32; N]) -> u32 {
+    let mut acc = 0u32;
+    for &x in buf.iter() {
+        if x >= T {
+            acc = black_box(acc.wrapping_add(x - T));
+        } else {
+            acc = acc.wrapping_add(x);
         }
-        let e = rdtsc();
-        black_box(acc);
-        (e - s) as f64
-    };
-    let (mut c0, mut c1) = (Vec::with_capacity(n), Vec::with_capacity(n));
-    for i in 0..n {
-        c0.push(run(&pool0[i % POOL]));
-        c1.push(run(&pool1[i % POOL]));
     }
-    (c0, c1)
+    acc
+}
+
+const POOL: usize = 64;
+
+/// Fill `work` with `fixed` (class 0) or with `random` (class 1). Both are read in
+/// full whatever the class, and a mask keeps one of them.
+fn select(work: &mut [u8], fixed: &[u8], random: &[u8], class: usize) {
+    let mask = black_box((class as u8).wrapping_neg());
+    for ((w, &f), &r) in work.iter_mut().zip(fixed).zip(random) {
+        *w = f ^ ((f ^ r) & mask);
+    }
+}
+
+fn random_slot(rng: &mut StdRng) -> [u8; SLOT_BYTES] {
+    let mut data = [0u8; SLOT_BYTES];
+    rng.fill_bytes(&mut data);
+    data
 }
 
 fn main() {
-    let ctx = NttContext::new();
+    let scale: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let ctx = &NTT_CONTEXT;
+    // Fixed test inputs: reproducible measurements, not a way to seed real keys.
     let mut rng = StdRng::seed_from_u64(1);
-    let (sk, pk) = keygen(&mut rng, &ctx);
+    let (sk, pk) = keygen(&mut rng, ctx);
+    let fixed_data = random_slot(&mut rng);
+    let fixed_msg = encode(&fixed_data);
+    let fixed_ct = encrypt_slot(&mut rng, ctx, &pk, &fixed_msg, Flooding::Standard);
+
+    // Generator streams: the fixed class always replays one, the random class
+    // takes a fresh one (which is drawn in both cases).
+    let fixed_seed = [0x5au8; 32];
+    let mut fresh = StdRng::seed_from_u64(0xF2E5);
+    let mut seed_for = |class: usize| -> [u8; 32] {
+        let mut seed = [0u8; 32];
+        fresh.fill_bytes(&mut seed);
+        if class == 0 { fixed_seed } else { seed }
+    };
+
+    // Inputs that live in memory, in serialized form: the fixed value and a pool
+    // of random ones.
+    let fixed_key = sk.to_bytes();
+    let random_keys: Vec<Vec<u8>> = (0..POOL).map(|_| keygen(&mut rng, ctx).0.to_bytes().to_vec()).collect();
+    let random_payloads: Vec<[u8; SLOT_BYTES]> = (0..POOL).map(|_| random_slot(&mut rng)).collect();
+    let fixed_ct_bytes = serialize_slot(&fixed_ct);
+    let encrypted = |d| serialize_slot(&encrypt_slot(&mut rng, ctx, &pk, &encode(d), Flooding::Standard));
+    let random_cts: Vec<Vec<u8>> = random_payloads.iter().map(encrypted).collect();
+    // For the branch control only: one pool of inputs per class.
+    let below: [u32; N] = std::array::from_fn(|_| rng.next_u32() % T);
+    let anywhere: Vec<[u32; N]> = (0..POOL).map(|_| std::array::from_fn(|_| rng.next_u32())).collect();
+    let words = [vec![below; POOL], anywhere];
+
+    // The working buffers that the inputs are assembled in.
+    let mut samples = [0i32; N];
+    let mut work_words = [0u32; N];
+    let mut work_key = fixed_key.to_vec();
+    let mut work_payload = fixed_data;
+    let mut work_ct = fixed_ct_bytes.clone();
 
     println!("TVLA fixed-vs-random timing-leakage test (Welch t; |t| < 4.5 => no leakage detected)\n");
+    let mut i = 0;
+    let mut next = || {
+        i = (i + 1) % POOL;
+        i
+    };
 
-    // Warm up caches / frequency.
-    let _ = leak_leaky(5_000);
+    println!("Controls (the first must pass, the second must be flagged):");
+    run("control: same inputs", 20_000 * scale, |_| {
+        let mut g = StdRng::from_seed(fixed_seed);
+        ticks(|| sample_gaussian_cdt(&mut g, &mut samples))
+    });
+    run("control: one branch per coeff", 20_000 * scale, |class| {
+        work_words = words[class][next()];
+        ticks(|| branchy_sum(black_box(&work_words)))
+    });
 
-    let fixed_random = rand_message(&mut rng);
-    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &fixed_random);
-    report("encrypt_slot", &a, &b);
+    println!("\nSecret randomness (fixed vs. random generator stream):");
+    run("base sampler", 20_000 * scale, |class| {
+        let mut g = StdRng::from_seed(seed_for(class));
+        ticks(|| sample_gaussian_cdt(&mut g, &mut samples))
+    });
+    run("flood sampler", 20_000 * scale, |class| {
+        let mut g = StdRng::from_seed(seed_for(class));
+        ticks(|| add_flood(&mut g, &mut samples))
+    });
+    run("keygen (fixed a)", 5_000 * scale, |class| {
+        let mut g = Split { words32: StdRng::from_seed(fixed_seed), words64: StdRng::from_seed(seed_for(class)) };
+        ticks(|| keygen(&mut g, ctx))
+    });
+    run("encrypt_slot", 5_000 * scale, |class| {
+        let mut g = StdRng::from_seed(seed_for(class));
+        ticks(|| encrypt_slot(&mut g, ctx, &pk, &fixed_msg, Flooding::Standard))
+    });
+    run("rerandomize_slot", 5_000 * scale, |class| {
+        let mut g = StdRng::from_seed(seed_for(class));
+        ticks(|| rerandomize_slot(&mut g, ctx, &pk, &fixed_ct))
+    });
 
-    let (a, b) = leak_rerand(&ctx, &pk, 30_000);
-    report("rerandomize", &a, &b);
+    println!("\nSecret key (fixed vs. random key):");
+    run("decrypt_slot", 20_000 * scale, |class| {
+        select(&mut work_key, &fixed_key, &random_keys[next()], class);
+        let key = SecretKey::from_bytes(&work_key).expect("valid key");
+        ticks(|| decrypt_slot(ctx, &key, &fixed_ct))
+    });
+    run("SecretKey::from_bytes", 20_000 * scale, |class| {
+        select(&mut work_key, &fixed_key, &random_keys[next()], class);
+        ticks(|| SecretKey::from_bytes(&work_key))
+    });
 
-    let (a, b) = leak_decrypt(&ctx, &sk, &pk, 80_000);
-    report("decrypt_slot", &a, &b);
+    println!("\nPlaintext and ciphertext (fixed vs. random):");
+    run("encrypt_slot (plaintext)", 5_000 * scale, |class| {
+        let mut g = StdRng::from_seed(fixed_seed);
+        select(&mut work_payload, &fixed_data, &random_payloads[next()], class);
+        let msg = encode(&work_payload);
+        ticks(|| encrypt_slot(&mut g, ctx, &pk, &msg, Flooding::Standard))
+    });
+    run("rerandomize_slot (ciphertext)", 5_000 * scale, |class| {
+        let mut g = StdRng::from_seed(fixed_seed);
+        select(&mut work_ct, &fixed_ct_bytes, &random_cts[next()], class);
+        let ct = deserialize_slot(&work_ct).expect("valid ciphertext");
+        ticks(|| rerandomize_slot(&mut g, ctx, &pk, &ct))
+    });
+    run("decrypt_slot (ciphertext)", 20_000 * scale, |class| {
+        select(&mut work_ct, &fixed_ct_bytes, &random_cts[next()], class);
+        let ct = deserialize_slot(&work_ct).expect("valid ciphertext");
+        ticks(|| decrypt_slot(ctx, &sk, &ct))
+    });
 
-    let (a, b) = leak_leaky(400_000);
-    report("leaky_reduce (control)", &a, &b);
-
-    println!("\nHardware data-path diagnostics (see module docs):");
-    let (a, b) = leak_encrypt(&ctx, &pk, 30_000, &[0u32; N]);
-    report("encrypt (all-zero msg)", &a, &b);
-
-    let (a, b) = leak_hw_zero_load(200_000);
-    report("hw zero-load baseline", &a, &b);
+    println!("\nHardware diagnostic (see module docs):");
+    // The smallest and the largest probability, and both sides of the boundary
+    // (p = 0.02425) between the tail and the central region of the probit.
+    let boundary = ((0.0485 * (1u64 << 52) as f64) as u64) << 12;
+    let chosen = [0, u64::MAX, boundary, boundary - (1 << 12)];
+    run("flood sampler (chosen inputs)", 20_000 * scale, |class| {
+        let mask = (class as u64).wrapping_sub(1);
+        let mut g = Chosen { chosen, mask, random: StdRng::from_seed(fixed_seed), count: 0 };
+        ticks(|| add_flood(&mut g, &mut samples))
+    });
 
     println!(
-        "\nNotes: the positive control is expected to show LEAKAGE; the constant-time\n\
-         targets are expected to stay below the 4.5 threshold. On CPUs with\n\
-         data-dependent bit-toggle timing (observed on Zen 4), the zero-load\n\
-         baseline is robustly flagged and the all-zero encrypt diagnostic may be\n\
-         flagged at a ~0.02% difference: a degenerate all-zero input can be\n\
-         distinguishable at the hardware level even for branchless code (the\n\
-         zero-load baseline contains no crypto arithmetic). AEAD-wrapped payloads\n\
-         (the intended deployment) are uniformly random, so this input never occurs.\n\
+        "\nNotes: the second control is expected to show LEAKAGE; the first control and\n\
+         the constant-time targets are expected to stay below the 4.5 threshold.\n\
          Re-run under low load."
     );
 }

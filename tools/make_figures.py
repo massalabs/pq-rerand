@@ -5,6 +5,11 @@ Run from the pq-rerand/ directory: python3 tools/make_figures.py
 
 Fixed-key simulation: 10 keys x 5 trials per key, matching Theorem 4.6's
 operational setting (key fixed, randomness over encryption/rerand only).
+
+The simulation is an idealized model of the scheme: it draws rounded Gaussians
+from NumPy and multiplies polynomials on its own. It validates the noise
+analysis, not the Rust implementation, whose samplers are covered by the tests
+of the crate.
 """
 
 import numpy as np

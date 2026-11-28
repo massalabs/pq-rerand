@@ -5,9 +5,13 @@
 !rust_implem/
 !rust_implem/**
 
-# Allow the Python tools
+# Allow the analysis tools
 !tools/
 !tools/**
+
+# Allow the CI workflows
+!.github/
+!.github/**
 
 # Allow top-level files
 !.gitignore

@@ -1,38 +1,68 @@
 //! Encryption: base BFV encrypt + noise-flooding smudge.
 
 use crate::params::{N, T, Q2, DELTA_T};
-use crate::ntt::{pointwise_add, pointwise_mul, barrett_mu, barrett_reduce, addmod};
-use crate::poly::{Poly, NttContext};
+use crate::ntt::{pointwise_mul, mul_shoup, shoup, addmod};
+use crate::poly::{NttContext, add_signed, secret, set_signed, zeroed};
+use crate::encoding::Plaintext;
 use crate::keygen::PublicKey;
-use crate::sampling::{sample_gaussian, sample_gaussian_cdt};
-use rand::{CryptoRng, Rng};
-use zeroize::Zeroize;
+use crate::sampling::{add_flood, sample_gaussian_cdt, wiped};
+use rand_core::{CryptoRng, Rng};
 
 /// A single ciphertext slot: (c0_t, c0_q2, c1_t, c1_q2), all in coefficient domain.
+///
+/// The limbs live on the heap: returning or moving a slot moves four pointers, not
+/// 64 KiB through every stack frame on the way.
 #[derive(Clone, Debug)]
 pub struct CiphertextSlot {
     /// `c₀ mod t`, coefficient domain.
-    pub c0_t: [u32; N],
+    pub(crate) c0_t: Box<[u32; N]>,
     /// `c₀ mod q₂`, coefficient domain.
-    pub c0_q2: [u32; N],
+    pub(crate) c0_q2: Box<[u32; N]>,
     /// `c₁ mod t`, coefficient domain.
-    pub c1_t: [u32; N],
+    pub(crate) c1_t: Box<[u32; N]>,
     /// `c₁ mod q₂`, coefficient domain.
-    pub c1_q2: [u32; N],
+    pub(crate) c1_q2: Box<[u32; N]>,
 }
 
-/// Encrypt a single message polynomial M (coefficients in [0, 2^31 - 1]).
-/// Performs base encryption + noise-flooding smudge.
+impl CiphertextSlot {
+    /// The all-zero slot, to be written in place.
+    pub(crate) fn zeroed() -> Self {
+        CiphertextSlot { c0_t: zeroed(), c0_q2: zeroed(), c1_t: zeroed(), c1_q2: zeroed() }
+    }
+}
+
+/// Noise flooding applied by encryption (paper section 6).
 ///
-/// The RNG must be cryptographically secure (enforced via the [`CryptoRng`]
-/// marker bound). Transient encryption randomness is zeroized before returning.
-pub fn encrypt_slot<R: Rng + CryptoRng>(
+/// The flood packet makes a fresh ciphertext look, to the secret-key holder, like
+/// one that was already re-randomized `KAPPA_F` times. It only hides the number of
+/// re-randomizations while that number is small next to `KAPPA_F` and the holder
+/// sees a single version of the ciphertext: two versions of one ciphertext differ
+/// by exactly the noise added in between. Neither confidentiality nor
+/// unlinkability against parties without the secret key depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flooding {
+    /// No flood packet (`kappa_f = 0`).
+    Off,
+    /// One flood packet of width [`SIGMA_FLOOD`](crate::params::SIGMA_FLOOD)
+    /// (`kappa_f` = [`KAPPA_F`](crate::params::KAPPA_F)): the analyzed configuration.
+    Standard,
+}
+
+/// Overwrite `ct` with a fresh encryption of zero under `pk`: `(b*R + E2, a*R + E1)`
+/// with base-width noise, widened by a flood packet if `flood` says so.
+///
+/// This is the whole of re-randomization and, up to the message term, of
+/// encryption. The randomness and the products only ever exist in zeroizing heap
+/// storage and in `ct` itself, which the caller completes in place. The callers
+/// run it through [`wiped`]: a compiler may keep a few coefficients of the noise
+/// in the stack frame of this function, which is then overwritten as well.
+pub(crate) fn encrypt_zero<R: Rng + CryptoRng>(
     rng: &mut R,
     ctx: &NttContext,
     pk: &PublicKey,
-    message: &[u32; N],
-    sigma_flood: f64,
-) -> CiphertextSlot {
+    flood: Flooding,
+    ct: &mut CiphertextSlot,
+) {
     // Sample base-width noise (constant-time CDT) and flood-width noise, then add
     // them coefficient-wise. The base encryption and the flooding Enc(0) are both
     // linear in their randomness/noise, so a separate smudge step
@@ -42,72 +72,69 @@ pub fn encrypt_slot<R: Rng + CryptoRng>(
     // halves the NTT work (one forward of R, one inverse per ciphertext component)
     // while leaving the output distribution — and hence the security analysis —
     // unchanged. Flooding therefore costs only its extra sampling, not extra NTTs.
-    let mut r_b = sample_gaussian_cdt(rng);
-    let mut e1_b = sample_gaussian_cdt(rng);
-    let mut e2_b = sample_gaussian_cdt(rng);
-    let mut r_f = sample_gaussian(rng, sigma_flood);
-    let mut e1_f = sample_gaussian(rng, sigma_flood);
-    let mut e2_f = sample_gaussian(rng, sigma_flood);
-
-    let mut r_int = [0i64; N];
-    let mut e1_int = [0i64; N];
-    let mut e2_int = [0i64; N];
-    for i in 0..N {
-        r_int[i] = r_b[i] + r_f[i];
-        e1_int[i] = e1_b[i] + e1_f[i];
-        e2_int[i] = e2_b[i] + e2_f[i];
+    let (mut r, mut e1, mut e2) = (secret::<i32>(), secret::<i32>(), secret::<i32>());
+    sample_gaussian_cdt(rng, &mut r);
+    sample_gaussian_cdt(rng, &mut e1);
+    sample_gaussian_cdt(rng, &mut e2);
+    if flood == Flooding::Standard {
+        add_flood(rng, &mut r);
+        add_flood(rng, &mut e1);
+        add_flood(rng, &mut e2);
     }
-    r_b.zeroize();
-    e1_b.zeroize();
-    e2_b.zeroize();
-    r_f.zeroize();
-    e1_f.zeroize();
-    e2_f.zeroize();
-
-    let mut r = Poly::from_signed(&r_int);
-    let mut e1 = Poly::from_signed(&e1_int);
-    let mut e2 = Poly::from_signed(&e2_int);
-    r_int.zeroize();
-    e1_int.zeroize();
-    e2_int.zeroize();
 
     // NTT of the combined randomness R = r + r_f.
-    let (mut r_ntt_t, mut r_ntt_q2) = ctx.forward(&r);
+    let (mut r_ntt_t, mut r_ntt_q2) = (secret(), secret());
+    set_signed(&mut r_ntt_t, &mut r_ntt_q2, &r);
+    ctx.tables_t.forward(&mut r_ntt_t);
+    ctx.tables_q2.forward(&mut r_ntt_q2);
 
     // c1 = a·R + E1 (in each limb)
-    let mut c1_t = pointwise_mul(&pk.a_ntt_t, &r_ntt_t, T);
-    let mut c1_q2 = pointwise_mul(&pk.a_ntt_q2, &r_ntt_q2, Q2);
-    ctx.tables_t.inverse(&mut c1_t);
-    ctx.tables_q2.inverse(&mut c1_q2);
-    c1_t = pointwise_add(&c1_t, &e1.limb_t, T);
-    c1_q2 = pointwise_add(&c1_q2, &e1.limb_q2, Q2);
+    ct.c1_t.copy_from_slice(&*pk.a_ntt_t);
+    ct.c1_q2.copy_from_slice(&*pk.a_ntt_q2);
+    pointwise_mul(&mut ct.c1_t, &r_ntt_t, T);
+    pointwise_mul(&mut ct.c1_q2, &r_ntt_q2, Q2);
+    ctx.tables_t.inverse(&mut ct.c1_t);
+    ctx.tables_q2.inverse(&mut ct.c1_q2);
+    add_signed(&mut ct.c1_t, &mut ct.c1_q2, &e1);
 
-    // c0 = b·R + E2 + Δ_t·M (t-limb) or b·R + E2 + 0 (q2-limb)
-    let mut c0_t = pointwise_mul(&pk.b_ntt_t, &r_ntt_t, T);
-    let mut c0_q2 = pointwise_mul(&pk.b_ntt_q2, &r_ntt_q2, Q2);
-    ctx.tables_t.inverse(&mut c0_t);
-    ctx.tables_q2.inverse(&mut c0_q2);
-    c0_t = pointwise_add(&c0_t, &e2.limb_t, T);
-    c0_q2 = pointwise_add(&c0_q2, &e2.limb_q2, Q2);
+    // c0 = b*R + E2 (in each limb)
+    ct.c0_t.copy_from_slice(&*pk.b_ntt_t);
+    ct.c0_q2.copy_from_slice(&*pk.b_ntt_q2);
+    pointwise_mul(&mut ct.c0_t, &r_ntt_t, T);
+    pointwise_mul(&mut ct.c0_q2, &r_ntt_q2, Q2);
+    ctx.tables_t.inverse(&mut ct.c0_t);
+    ctx.tables_q2.inverse(&mut ct.c0_q2);
+    add_signed(&mut ct.c0_t, &mut ct.c0_q2, &e2);
+}
 
-    // Add Δ_t · M to c0_t (message embedding — message lives in t-limb only).
-    // Division-free reduction via Barrett.
-    let mu_t = barrett_mu(T);
-    for i in 0..N {
-        let delta_m = barrett_reduce(DELTA_T as u64 * message[i] as u64, T, mu_t);
-        c0_t[i] = addmod(c0_t[i], delta_m, T);
-    }
+/// Encrypt a single plaintext slot (see [`encode`](crate::encoding::encode)).
+/// Performs base encryption + noise-flooding smudge, as selected by `flood`.
+///
+/// The RNG must be cryptographically secure (enforced via the [`CryptoRng`]
+/// marker bound). The encryption randomness reveals the plaintext: it only ever
+/// exists in heap storage that is zeroized before returning.
+///
+/// `pk` must be authentic (see [`PublicKey`]).
+pub fn encrypt_slot<R: Rng + CryptoRng>(
+    rng: &mut R,
+    ctx: &NttContext,
+    pk: &PublicKey,
+    message: &Plaintext,
+    flood: Flooding,
+) -> CiphertextSlot {
+    let mut ct = CiphertextSlot::zeroed();
+    wiped(|| {
+        encrypt_zero(rng, ctx, pk, flood, &mut ct);
 
-    // Best-effort scrubbing of the remaining transient secrets (encryption
-    // randomness in coefficient and NTT domain).
-    r.limb_t.zeroize();
-    r.limb_q2.zeroize();
-    e1.limb_t.zeroize();
-    e1.limb_q2.zeroize();
-    e2.limb_t.zeroize();
-    e2.limb_q2.zeroize();
-    r_ntt_t.zeroize();
-    r_ntt_q2.zeroize();
-
-    CiphertextSlot { c0_t, c0_q2, c1_t, c1_q2 }
+        // Add Delta_t * M to c0_t (the message lives in the t limb only), in the
+        // wiped frame as well: a compiler may keep coefficients of the message on
+        // the stack. Shoup multiplication has no final conditional subtraction
+        // that a compiler could turn into a branch on the message.
+        const DELTA_SHOUP: u64 = shoup(DELTA_T, T);
+        for i in 0..N {
+            let delta_m = mul_shoup(message.0[i], DELTA_T, DELTA_SHOUP, T);
+            ct.c0_t[i] = addmod(ct.c0_t[i], delta_m, T);
+        }
+    });
+    ct
 }

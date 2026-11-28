@@ -24,13 +24,31 @@ This construction is engineered around a **two-limb CRT modulus** `q = t · q₂
 
 **This implementation has not yet been externally audited.** It is written to production-quality standards and is intended to be audit-ready:
 
-- The base-width Gaussian sampler (keygen, base encryption, re-randomization) is a **constant-time CDT** discrete-Gaussian sampler (fixed-length branchless table scan).
+- The base-width Gaussian sampler (keygen, base encryption, re-randomization) is a **constant-time CDT** discrete-Gaussian sampler (fixed-length branchless table scan). Its table is a constant: every nonzero magnitude has its probability in the discrete Gaussian rounded to the 63 bits of the uniform draw, and zero has the rest. The sampled distribution is within statistical distance 2^-60.96 of the discrete Gaussian and is the same on every platform; `tools/lean/cdt_table.lean` rebuilds the table in Lean 4, compares it with the Rust constant and bounds that distance.
 - The flood-width sampler is a **branchless constant-time inverse-CDF** sampler (no rejection loop, no data-dependent branch or table indexing).
 - The NTT / modular-arithmetic layer — including the secret-dependent decryption path (center-lift and final reduction) — is **branchless and division-free by construction**: control flow and memory-access patterns are independent of operand values.
-- All RNG inputs are bounded by `rand::CryptoRng`, enforcing a CSPRNG at the type level. Secret keys are zeroized on drop; transient secrets are zeroized best-effort. The library is `#![forbid(unsafe_code)]`.
-- A TVLA/dudect-style fixed-vs-random timing-leakage harness (`cargo run --release --example leakage`) reports no measurable leakage (Welch |t| < 4.5) on the encryption, re-randomization and decryption paths, while flagging a deliberately variable-time control (|t| > 3000). The harness also includes a hardware diagnostic: on CPUs with data-dependent bit-toggle timing (observed on Zen 4), *all-zero* vs random data content is distinguishable at the ~0.02% level even for a pure load loop with no crypto arithmetic; AEAD-wrapped payloads (the intended deployment) are uniformly random, so such degenerate inputs cannot occur.
+- All RNG inputs are bounded by `rand_core::CryptoRng`, enforcing a CSPRNG at the type level (the bound cannot tell how the generator was seeded: seed it from the operating system). The samplers read the generator in a fixed, documented order, so a key pair derived from a seeded generator is the same on every platform. The library is `#![forbid(unsafe_code)]`.
+- Secret keys, plaintexts and transient secrets (encryption and re-randomization randomness, decryption intermediates) are held in heap storage that is zeroized on drop and are computed there in place: these arrays are not moved or returned through the stack. The per-slot generators of the batch layer are zeroized too, and the part of the stack that a generator worked on is wiped after each sampling call. Keys and ciphertexts keep their limbs on the heap, so in release builds no operation needs more than 16 KiB of stack with the shared `NTT_CONTEXT`, and a full batch runs on worker stacks of 256 KiB. These measures are best effort: a compiler may still spill individual values, and CPU registers keep parts of the last arrays they processed.
+- A TVLA/dudect-style fixed-vs-random timing-leakage harness (`cargo run --release --example leakage`) measures both samplers, key generation, encryption, re-randomization, decryption and secret-key parsing over their secret inputs (generator stream, secret key) as well as over plaintexts and ciphertexts, drawing the class of each measurement at random and reading the same memory whatever the class. On the machine of the benchmarks below, in portable and native builds (eight runs of 10,000 to 200,000 measurements per test), no sampler and no operation is flagged: the largest |t| is 3.3 against a threshold of 4.5, while a control with one data-dependent branch per coefficient gives |t| above 2400. It also runs the flood sampler on chosen inputs, as the latency of a floating-point division or square root depends on the operands on some CPUs.
+- A secret-taint harness (`examples/ctgrind.rs`, run under Valgrind) marks the secrets as undefined and checks that no conditional branch and no memory address depends on them, in the samplers and in every operation; only the final verdict of the two parsers of secret data (`SecretKey::from_bytes`, `decode`) may. It runs in CI on x86-64 (baseline and x86-64-v3 builds), 32-bit x86 and aarch64. It cannot run under emulation, nor on a build that uses AVX-512: on 32-bit ARM, CI checks instead that the compiled crate calls no rounding, conversion or division routine of the run-time libraries and that the flood sampler calls no library routine but `memset`. The 32-bit ARM and Android builds were otherwise checked by reading their assembly.
+- A memory-residue scan (`examples/residue.rs`) runs the operations on known secrets, drops everything, and searches the heap and the stacks of all threads of the process for the keys and the output of the generators, for the secrets in the forms in which the library holds them (keys, errors, encryption randomness and plaintexts, as sampled, reduced or transformed) and for what it computes from them on the way to its results (products with public values, the encryption of zero that a message is added to or that a re-randomization adds, the noisy plaintext of a decryption). Freed memory is not reused and every operation runs on threads of its own, so nothing is overwritten before the search. It runs in CI on x86-64 (baseline and x86-64-v3 builds), aarch64, 32-bit ARM and 32-bit x86.
+
+These properties hold for optimized builds without overflow checks (the release profile): debug builds branch on secret values and must not process real keys. They are properties of a build, not of the source alone, and on x86 of the CPU as well (the generator selects its code at run time; CI also runs the memory scan emulating a CPU without AVX2): repeat the taint check and the memory scan, like the timing assessment, on every target platform. The flood sampler computes in floating point, so it needs hardware floating point and relies on the division and square root of the CPU taking a time that does not depend on their operands.
 
 Branchless source plus one leakage run is not a substitute for microarchitectural verification: production deployments should repeat the timing-leakage assessment on their target platform (desktop and mobile) and an external audit is recommended before production use.
+
+## Using it safely
+
+The RLWE layer is malleable by design (that is what makes public re-randomization possible) and only CPA-secure. An application must:
+
+- **Authenticate the payload**: encrypt an AEAD ciphertext, and verify it before using anything that was decrypted.
+- **Hide decryption outcomes** from anyone who can submit or modify ciphertexts, including through errors, retries, replies, later writes and timing. Each observed success or failure of a modified ciphertext is a comparison on a secret value, and some 16,000 of them recover the secret key, also when honest parties re-randomize in between. The usual defense, re-encrypting the result to check it, is not available to a re-randomizable scheme.
+- **Treat unauthenticated decryption output as key material**: a crafted ciphertext can decrypt to a function of the secret key. The output comes in zeroizing containers; drop it when authentication fails and never log it.
+- **Count failed decryptions per key** and rotate the key after a small number of them.
+- **Authenticate public keys**, including those only used to re-randomize: whoever replaces a public key can read what is encrypted under it and link what is re-randomized under it. `PublicKey::verify_against` checks a stored public key against its secret key.
+- **Track the re-randomization budget** (below): the library cannot count re-randomizations.
+
+Any party handling a ciphertext can also add an offset to it that stays below the decryption threshold: the plaintext still decrypts, later re-randomizations do not remove the offset and the secret-key holder can read it. Unlinkability holds against observers without the secret key; a relay colluding with the recipient can mark a ciphertext unless every hop proves that it added a well-formed encryption of zero. The crate documentation states these requirements in full.
 
 ## Parameters
 
@@ -60,22 +78,24 @@ With a per-batch failure probability of 2⁻¹⁰⁶ and B = 1024 slots:
 | No flooding (κ_f = 0) | ≈ 1.5 × 10¹⁰ | ~476 years at 1 rerand/s |
 | With flooding (κ_f = 8.58 × 10⁸) | ≈ 1.4 × 10¹⁰ additional | ~448 years at 1 rerand/s |
 
+The count is deliberately absent from the ciphertext, so nothing in the library tracks or enforces this budget: the application keeps an upper bound on it (for example age times maximum rate) and refreshes a ciphertext, by decrypting and encrypting it again, before the limit (`params::K_MAX_RERAND`). Flooding hides the number of re-randomizations from the secret-key holder only while that number is small next to `kappa_f` and the holder sees a single version of the ciphertext.
+
 ## Benchmark results
 
-Measured on AMD Ryzen 7 260 (8C/16T, Zen 4, 3.8 GHz base / 5.0 GHz boost), 32 GiB DDR5, Linux 7.0, rustc 1.94.1, `--release` with `RUSTFLAGS="-C target-cpu=native"` (auto-vectorized; no hand-written SIMD intrinsics). Criterion medians.
+Measured on AMD Ryzen 7 260 (8C/16T, Zen 4, 3.8 GHz base / 5.0 GHz boost), 32 GiB DDR5, Linux 7.0, rustc 1.100.0, `--release` with `RUSTFLAGS="-C target-cpu=native"` (auto-vectorized; no hand-written SIMD intrinsics). Criterion medians.
 
 **Fixed-frequency config** (reproducible: `cpupower frequency-set -g performance`, turbo boost disabled, all cores pinned at 3.8 GHz):
 
 | Operation | 1 thread | 16 threads (per slot, B=1024) |
 |-----------|---------:|------------------------------:|
-| Key generation | 0.92 ms | — |
-| Encrypt (base + folded flood) | 0.80 ms | 0.096 ms |
-| Re-randomize | 0.51 ms | 0.070 ms |
-| Decrypt | 0.21 ms | 0.025 ms |
+| Key generation | 0.33 ms | - |
+| Encrypt (base + folded flood) | 0.41 ms | 0.053 ms |
+| Re-randomize | 0.30 ms | 0.044 ms |
+| Decrypt | 0.16 ms | 0.022 ms |
 
-With turbo boost enabled (OS-default scaling): encrypt 0.63 ms, re-randomize 0.41 ms, decrypt 0.16 ms (single thread).
+A portable build (no `target-cpu` flag) takes 0.43 ms, 0.66 ms, 0.45 ms and 0.22 ms on one thread at the same fixed frequency. With turbo boost enabled (OS-default scaling), the native build takes 0.31 ms to encrypt, 0.23 ms to re-randomize and 0.12 ms to decrypt (single thread).
 
-Versus the original reference implementation at the same fixed frequency (encrypt 3.24 ms, re-randomize 1.62 ms, decrypt 1.47 ms), the optimized arithmetic (Barrett reduction, Shoup-multiply butterflies with precomputed bit-reversed twiddles, folded flooding, cached key NTT) is **3.1–7.1× faster** single-threaded; rayon batch operations add a further ~7–8× across 16 hardware threads. A full 15.5 MiB batch (1024 slots) re-randomizes in 0.072 s and decrypts in 0.026 s on 16 threads.
+Versus the original reference implementation at the same fixed frequency (encrypt 3.24 ms, re-randomize 1.62 ms, decrypt 1.47 ms), the optimized arithmetic (Barrett reduction, Shoup-multiply butterflies with precomputed bit-reversed twiddles, folded flooding, cached key NTT) is **5.5 to 9.0 times faster** single-threaded; rayon batch operations add a further factor of about 7 across 16 hardware threads. A full 15.5 MiB batch (1024 slots) re-randomizes in 0.045 s and decrypts in 0.023 s on 16 threads.
 
 Reproduce with:
 
@@ -91,13 +111,14 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release --example leakage
 
 ```
 pq-rerand/
-├── rust_implem/               # Rust implementation (~1550 LOC)
+├── .github/workflows/ci.yml   # Tests (x86-64, aarch64, 32-bit ARM and x86), minimum Rust version, target builds, taint, residue and sampler-table checks
+├── rust_implem/               # Rust implementation (~850 LOC of library code, plus tests)
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── lib.rs             # Crate root (forbid(unsafe_code), security notes)
 │   │   ├── params.rs          # Scheme parameters and constants
 │   │   ├── ntt.rs             # Negacyclic NTT (Barrett/Shoup, branchless, const tables)
-│   │   ├── poly.rs            # CRT polynomial types and ring arithmetic
+│   │   ├── poly.rs            # NTT context, zeroizing storage and CRT-limb helpers
 │   │   ├── sampling.rs        # Constant-time CDT + inverse-CDF Gaussian samplers
 │   │   ├── encoding.rs        # 31-bit plaintext encoding (bytes ↔ coefficients)
 │   │   ├── keygen.rs          # Key generation (zeroized secret key, cached NTT)
@@ -109,14 +130,20 @@ pq-rerand/
 │   ├── benches/
 │   │   └── bench.rs           # Criterion benchmarks
 │   ├── examples/
+│   │   ├── ctgrind.rs         # Secret-taint harness for Valgrind (x86, x86_64, aarch64)
 │   │   ├── leakage.rs         # TVLA/dudect timing-leakage harness (x86_64 + aarch64)
+│   │   ├── residue.rs         # Memory-residue scan of the heap and all stacks (Linux)
 │   │   └── timings.rs         # Standalone timing harness (single + batch, 1/N threads)
 │   └── tests/
 │       └── correctness.rs     # Integration tests
-├── tools/                     # Python scripts for analysis and figures
+├── tools/                     # Analysis scripts and figures
 │   ├── make_figures.py        # Generate publication figures (requires numpy, matplotlib, scipy)
 │   ├── security_estimate.py   # HE Standard v1.1 security cross-check (pure Python)
-│   └── lattice_estimate_sage.py  # Lattice-estimator script (requires SageMath)
+│   ├── lattice_estimate_sage.py  # Lattice-estimator script (requires SageMath)
+│   └── lean/                  # Base sampler table, rebuilt and measured in Lean 4
+│       ├── cdt_table.lean     # Builds the table, compares it with the Rust constant, bounds its distance from the discrete Gaussian
+│       ├── cdt_table_out.txt  # Its output: the table and the distances of this and other constructions
+│       └── lean-toolchain     # Version of Lean
 ├── LICENSE                    # MIT
 └── README.md
 ```
@@ -126,17 +153,21 @@ pq-rerand/
 ```bash
 cd rust_implem
 cargo build --release    # portable build
+cargo test               # debug build: arithmetic overflow is checked
 cargo test --release
 cargo clippy --all-targets -- -D warnings
 RUSTFLAGS="-C target-cpu=native" cargo bench   # benchmarks with host SIMD
+cargo build --release --example ctgrind && valgrind target/release/examples/ctgrind   # secret-taint check
+cargo run --release --example residue          # memory-residue scan (Linux)
 ```
 
-The crate is portable across desktop and mobile targets (pure safe Rust, no architecture-specific intrinsics in the library; verified to build for `aarch64-unknown-linux-gnu`).
+Rust 1.88 or later is required. The crate is portable across desktop and mobile targets (pure safe Rust, no architecture-specific intrinsics in the library): the test suite, including its known-answer vectors, gives the same results on x86-64, aarch64, 32-bit ARM and 32-bit x86, and the library also builds for Android, iOS and WebAssembly targets.
 
 ## Running the analysis tools
 
 ```bash
 # Generate publication figures (outputs to paper/figures/)
+# Idealized model: it samples rounded Gaussians with NumPy, not with this crate.
 pip install numpy matplotlib scipy
 python3 tools/make_figures.py
 
@@ -145,6 +176,10 @@ python3 tools/security_estimate.py
 
 # Full lattice-estimator analysis (requires SageMath + lattice-estimator)
 sage tools/lattice_estimate_sage.py
+
+# Rebuild the table of the base sampler, compare it with the Rust constant and
+# bound its distance from the discrete Gaussian (requires Lean 4 through elan)
+(cd tools/lean && lean ./cdt_table.lean)
 ```
 
 ## How it works

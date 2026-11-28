@@ -1,8 +1,8 @@
 [package]
 name = "pq-rerand"
-version = "0.2.0"
-edition = "2021"
-rust-version = "1.74"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.88"
 description = "Post-quantum publicly re-randomizable encryption (BFV/LPR + CRT noise-limb trick). Constant-time by construction; not yet externally audited."
 license = "MIT"
 repository = "https://github.com/massalabs/pq-rerand"
@@ -10,12 +10,14 @@ keywords = ["post-quantum", "ring-lwe", "re-randomization", "encryption"]
 categories = ["cryptography"]
 
 [dependencies]
-rand = "0.8"
+chacha20 = { version = "0.10", default-features = false, features = ["rng", "zeroize"] }
+rand_core = "0.10"
 rayon = "1.12"
-zeroize = { version = "1.8", features = ["derive"] }
+zeroize = "1.8"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.10"
 
 [[bench]]
 name = "bench"
