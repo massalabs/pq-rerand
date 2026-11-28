@@ -102,13 +102,14 @@ fn test_serialization_roundtrip_via_crypto() {
 fn test_key_serialization_rejects_out_of_range() {
     let (sk, pk, _rng) = setup();
 
+    // The first coefficient follows the version byte.
     let mut pk_bytes = pk.to_bytes();
-    pk_bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    pk_bytes[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(PublicKey::from_bytes(&pk_bytes).is_none(), "out-of-range pk accepted");
 
     let sk_bytes = sk.to_bytes();
     let mut bad = sk_bytes.to_vec();
-    bad[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    bad[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(SecretKey::from_bytes(&bad).is_none(), "out-of-range sk accepted");
 }
 
@@ -168,16 +169,17 @@ fn test_wrong_key_does_not_decrypt() {
     assert!((1..32).contains(&rejected), "{rejected} of 64 wrong-key decryptions rejected");
 }
 
-/// Random and perturbed inputs to the three parsers: an input of the wrong length
-/// or with an unreduced coefficient is rejected, and whatever parses as a
-/// ciphertext decrypts and decodes without a panic (in debug builds: without an
-/// arithmetic overflow).
+/// Random and perturbed inputs to the three parsers: an input of the wrong length,
+/// of another version or with an unreduced coefficient is rejected, and whatever
+/// parses as a ciphertext decrypts and decodes without a panic (in debug builds:
+/// without an arithmetic overflow).
 #[test]
 fn test_parsers_on_random_inputs() {
     let (sk, pk, mut rng) = setup();
     let message = encode(&random_slot(&mut rng));
     let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &message, Flooding::Standard);
-    // In all three formats, the limbs alternate between t and q2.
+    // In all three formats, the limbs alternate between t and q2. They follow the
+    // version byte of a key (a slot has none): `header` below.
     let reduced = |data: &[u8]| {
         let words = data.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w));
         words.enumerate().all(|(i, w)| w < [T, Q2][i / N % 2])
@@ -191,12 +193,17 @@ fn test_parsers_on_random_inputs() {
     let mut accepted = 0;
     for round in 0..300 {
         for (good, parses) in &parsers {
+            let header = good.len() % 4;
             let mut data = good.clone();
             // Up to two words replaced by a value around a modulus or a random one.
             for _ in 0..rng.next_u32() % 3 {
-                let at = rng.next_u32() as usize % (data.len() / 4) * 4;
+                let at = header + rng.next_u32() as usize % (data.len() / 4) * 4;
                 let word = [0, 1, T - 1, T, Q2 - 1, Q2, u32::MAX, rng.next_u32()][rng.next_u32() as usize % 8];
                 data[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            // One round in eight replaces the version byte of a key.
+            if round % 8 == 5 {
+                data[..header].fill(rng.next_u32() as u8);
             }
             if round % 3 == 0 {
                 data.resize(good.len() + rng.next_u32() as usize % 9 - 4, 0);
@@ -205,7 +212,8 @@ fn test_parsers_on_random_inputs() {
                 rng.fill_bytes(&mut data);
             }
             let valid = parses(&data);
-            assert!(!valid || (data.len() == good.len() && reduced(&data)), "round {round}: invalid input accepted");
+            let well_formed = || data[..header] == good[..header] && reduced(&data[header..]);
+            assert!(!valid || (data.len() == good.len() && well_formed()), "round {round}: invalid input accepted");
             accepted += valid as usize;
             if let Some(ct) = deserialize_slot(&data) {
                 let _ = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct));
@@ -226,7 +234,8 @@ fn digest(bytes: &[u8]) -> u64 {
 /// derived from a ChaCha20 seed never changes.
 #[test]
 fn test_known_answers() {
-    // (seed byte, digests of the public key, secret key, ciphertext, re-randomized ciphertext)
+    // (seed byte, digests of the public key and of the secret key after their version
+    // byte, of the ciphertext and of the re-randomized ciphertext)
     let vectors: [(u8, [u64; 4]); 3] = [
         (1, [0x535a36f8fb8f7970, 0xef883001f8d26859, 0x6d107de92e2f1fb9, 0x5a6cdf1945e07613]),
         (2, [0x6f6693337c982f14, 0x4b97040803cac428, 0x221e61afd64c72c0, 0x8f2b5615f655fbf2]),
@@ -239,8 +248,8 @@ fn test_known_answers() {
         let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(&data), Flooding::Standard);
         let rerandomized = rerandomize_slot(&mut rng, &NTT_CONTEXT, &pk, &ct);
         let digests = [
-            digest(&pk.to_bytes()),
-            digest(&sk.to_bytes()),
+            digest(&pk.to_bytes()[1..]),
+            digest(&sk.to_bytes()[1..]),
             digest(&serialize_slot(&ct)),
             digest(&serialize_slot(&rerandomized)),
         ];

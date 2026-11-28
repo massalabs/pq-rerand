@@ -1,6 +1,6 @@
 //! Key generation.
 
-use crate::params::{N, T, Q2};
+use crate::params::{FORMAT_VERSION, N, T, Q2};
 use crate::ntt::{pointwise_add, pointwise_mul, pointwise_sub};
 use crate::poly::{NttContext, NTT_CONTEXT, Secret, is_small, secret, set_signed, zeroed};
 use crate::sampling::{sample_gaussian_cdt, sample_uniform};
@@ -68,14 +68,15 @@ impl SecretKey {
 
 impl SecretKey {
     /// Serialized byte size.
-    pub const BYTES: usize = 2 * N * 4;
+    pub const BYTES: usize = 1 + 2 * N * 4;
 
-    /// Serialize to bytes (little-endian u32 arrays).
+    /// Serialize to bytes ([`FORMAT_VERSION`], then little-endian u32 arrays).
     ///
     /// The returned buffer is zeroized on drop.
     #[must_use]
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut buf = Vec::with_capacity(Self::BYTES);
+        buf.push(FORMAT_VERSION);
         for arr in [&self.s_t, &self.s_q2] {
             for &val in arr.iter() {
                 buf.extend_from_slice(&val.to_le_bytes());
@@ -86,18 +87,18 @@ impl SecretKey {
 
     /// Deserialize from bytes.
     ///
-    /// Returns `None` if `data` is not exactly `BYTES` long or does not hold a
-    /// secret as key generation produces them: the two limbs must be the
-    /// reductions modulo `t` and `q2` of one non-zero polynomial with coefficients
-    /// of magnitude at most 29 and a squared norm of at most `2 N sigma^2`. The
-    /// whole input is read before the verdict, in constant time, and a rejected
-    /// key is zeroized.
+    /// Returns `None` if `data` is not exactly `BYTES` long, does not start with
+    /// [`FORMAT_VERSION`] or does not hold a secret as key generation produces
+    /// them: the two limbs must be the reductions modulo `t` and `q2` of one
+    /// non-zero polynomial with coefficients of magnitude at most 29 and a squared
+    /// norm of at most `2 N sigma^2`. Both limbs are read in full before the
+    /// verdict on them, in constant time, and a rejected key is zeroized.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() != Self::BYTES {
+        if data.len() != Self::BYTES || data[0] != FORMAT_VERSION {
             return None;
         }
         let mut sk = Self::zeroed();
-        let (bytes_t, bytes_q2) = data.split_at(N * 4);
+        let (bytes_t, bytes_q2) = data[1..].split_at(N * 4);
         for (limb, bytes) in [(&mut sk.s_t, bytes_t), (&mut sk.s_q2, bytes_q2)] {
             for (val, word) in limb.iter_mut().zip(bytes.as_chunks::<4>().0) {
                 *val = u32::from_le_bytes(*word);
@@ -122,12 +123,11 @@ impl SecretKey {
 /// used to re-randomize, by other means (for example a hash kept in authenticated
 /// storage).
 ///
-/// The serialized form is the four arrays below, each coefficient a little-endian
-/// `u32`. The NTT-domain order is part of that format: index `k` holds the
-/// evaluation at `psi^(2*bitrev(k)+1)`, where `bitrev` reverses 12 bits and `psi`
-/// is the 8192nd root of unity 101,573,657 modulo `t`, or 1,953,722,822 modulo
-/// `q2`. Neither keys nor ciphertexts carry a version or parameter tag: a
-/// container that may outlive this parameter set must record one itself.
+/// The serialized form is the byte [`FORMAT_VERSION`], then the four arrays
+/// below, each coefficient a little-endian `u32`. The NTT-domain order is part of
+/// that format: index `k` holds the evaluation at `psi^(2*bitrev(k)+1)`, where
+/// `bitrev` reverses 12 bits and `psi` is the 8192nd root of unity 101,573,657
+/// modulo `t`, or 1,953,722,822 modulo `q2`.
 ///
 /// The limbs live on the heap, like those of the other keys and of ciphertexts:
 /// returning or moving a key moves pointers, not 64 KiB through the stack.
@@ -150,12 +150,13 @@ impl PublicKey {
     }
 
     /// Serialized byte size.
-    pub const BYTES: usize = 4 * N * 4;
+    pub const BYTES: usize = 1 + 4 * N * 4;
 
-    /// Serialize to bytes (little-endian u32 arrays).
+    /// Serialize to bytes ([`FORMAT_VERSION`], then little-endian u32 arrays).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::BYTES);
+        buf.push(FORMAT_VERSION);
         for arr in [&self.a_ntt_t, &self.a_ntt_q2, &self.b_ntt_t, &self.b_ntt_q2] {
             for &val in arr.iter() {
                 buf.extend_from_slice(&val.to_le_bytes());
@@ -166,18 +167,18 @@ impl PublicKey {
 
     /// Deserialize from bytes.
     ///
-    /// Returns `None` if `data` is not exactly `BYTES` long, if any limb
-    /// coefficient is out of range (not fully reduced modulo `t` / `q2`), or if
-    /// the key is degenerate: `a` must be invertible (no zero coefficient in the
-    /// NTT domain) and `b` must not be zero, in both limbs. This rejects in
-    /// particular the all-zero key and keys with `a = 0` or `b = 0`, under which
-    /// anyone can decrypt. Key generation never outputs such a key (versions
-    /// before 0.3 did, for about one key in 350,000: such a key pair has to be
-    /// generated again).
+    /// Returns `None` if `data` is not exactly `BYTES` long, if it does not start
+    /// with [`FORMAT_VERSION`], if any limb coefficient is out of range (not fully
+    /// reduced modulo `t` / `q2`), or if the key is degenerate: `a` must be
+    /// invertible (no zero coefficient in the NTT domain) and `b` must not be
+    /// zero, in both limbs. This rejects in particular the all-zero key and keys
+    /// with `a = 0` or `b = 0`, under which anyone can decrypt. Key generation
+    /// never outputs such a key (before version 0.3 of the crate it did, for about
+    /// one key in 350,000: such a key pair has to be generated again).
     ///
     /// This is a sanity check, not an authentication: see [`PublicKey`].
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() != Self::BYTES {
+        if data.len() != Self::BYTES || data[0] != FORMAT_VERSION {
             return None;
         }
         let mut pk = PublicKey::zeroed();
@@ -187,7 +188,7 @@ impl PublicKey {
             (&mut pk.b_ntt_t, T),
             (&mut pk.b_ntt_q2, Q2),
         ];
-        let mut offset = 0;
+        let mut offset = 1;
         for (arr, modulus) in arrays {
             for val in arr.iter_mut() {
                 *val = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
@@ -301,15 +302,33 @@ mod tests {
         keygen(&mut rng, &NTT_CONTEXT)
     }
 
-    /// Replace one coefficient of a serialized limb.
+    /// Replace one coefficient of a serialized limb (the limbs follow the
+    /// version byte).
     fn patch(bytes: &mut [u8], limb: usize, index: usize, value: u32) {
-        let at = (limb * N + index) * 4;
+        let at = 1 + (limb * N + index) * 4;
         bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
 
     fn word(bytes: &[u8], limb: usize, index: usize) -> u32 {
-        let at = (limb * N + index) * 4;
+        let at = 1 + (limb * N + index) * 4;
         u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    /// A serialized key starts with the version byte, and no other value of that
+    /// byte is accepted.
+    #[test]
+    fn serialized_keys_carry_the_format_version() {
+        let (sk, pk) = test_keypair();
+        let (mut sk_bytes, mut pk_bytes) = (sk.to_bytes().to_vec(), pk.to_bytes());
+        assert_eq!((FORMAT_VERSION, sk_bytes[0], pk_bytes[0]), (1, 1, 1));
+        for version in (0..=u8::MAX).filter(|&v| v != FORMAT_VERSION) {
+            (sk_bytes[0], pk_bytes[0]) = (version, version);
+            assert!(SecretKey::from_bytes(&sk_bytes).is_none(), "secret key of version {version} accepted");
+            assert!(PublicKey::from_bytes(&pk_bytes).is_none(), "public key of version {version} accepted");
+        }
+        // Without the byte, the limbs alone are not a key.
+        assert!(SecretKey::from_bytes(&sk_bytes[1..]).is_none());
+        assert!(PublicKey::from_bytes(&pk_bytes[1..]).is_none());
     }
 
     #[test]
@@ -348,6 +367,7 @@ mod tests {
 
     #[test]
     fn pk_from_invalid_bytes() {
+        assert!(PublicKey::from_bytes(&[]).is_none());
         assert!(PublicKey::from_bytes(&[0u8; 10]).is_none());
         let (_sk, pk) = test_keypair();
         let good = pk.to_bytes();
@@ -370,13 +390,15 @@ mod tests {
     /// key, a = 0 or b = 0 in either limb, and a zero coefficient anywhere in a.
     #[test]
     fn pk_rejects_degenerate_keys() {
-        assert!(PublicKey::from_bytes(&vec![0u8; PublicKey::BYTES]).is_none());
-        assert!(PublicKey::from_bytes(&vec![1u8; PublicKey::BYTES]).is_some());
+        // Limbs filled with one byte value, after the version byte.
+        let filled = |byte: u8| [&[FORMAT_VERSION][..], &vec![byte; PublicKey::BYTES - 1]].concat();
+        assert!(PublicKey::from_bytes(&filled(0)).is_none());
+        assert!(PublicKey::from_bytes(&filled(1)).is_some());
         let (_sk, pk) = test_keypair();
         let good = pk.to_bytes();
         for limb in 0..4 {
             let mut bytes = good.clone();
-            bytes[limb * N * 4..(limb + 1) * N * 4].fill(0);
+            bytes[1..][limb * N * 4..(limb + 1) * N * 4].fill(0);
             assert!(PublicKey::from_bytes(&bytes).is_none(), "zero limb {limb} accepted");
             for index in [0, N - 1] {
                 let mut bytes = good.clone();
@@ -389,6 +411,7 @@ mod tests {
 
     #[test]
     fn sk_from_invalid_bytes() {
+        assert!(SecretKey::from_bytes(&[]).is_none());
         assert!(SecretKey::from_bytes(&[0u8; 10]).is_none());
         let (sk, _pk) = test_keypair();
         let good = sk.to_bytes();
@@ -431,8 +454,8 @@ mod tests {
             assert!(SecretKey::from_bytes(&bytes).is_none());
         }
         let mut rng = StdRng::seed_from_u64(5);
-        let mut random = vec![0u8; SecretKey::BYTES];
-        rand::Rng::fill_bytes(&mut rng, &mut random);
+        let mut random = vec![FORMAT_VERSION; SecretKey::BYTES];
+        rand::Rng::fill_bytes(&mut rng, &mut random[1..]);
         for i in 0..2 * N {
             let reduced = word(&random, 0, i) % if i < N { T } else { Q2 };
             patch(&mut random, 0, i, reduced);
