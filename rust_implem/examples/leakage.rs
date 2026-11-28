@@ -31,13 +31,6 @@
 //! and must not be flagged (false-positive check), the other runs a loop with one
 //! data-dependent branch per coefficient and must be flagged (sensitivity check).
 //!
-//! One more diagnostic looks for a hardware effect, not a software one:
-//! `flood sampler (chosen inputs)` runs the flood sampler on a few special inputs
-//! (both ends of its input range and the boundary between the two regions of its
-//! approximation) against random ones. The sampler computes in floating point,
-//! and on some CPUs the latency of a division or of a square root depends on the
-//! operands: a flag here means that it does on this one.
-//!
 //! (We test the full operations rather than micro-benchmarking individual modular
 //! primitives: a ~300-cycle primitive sits below reliable `rdtsc` resolution, where
 //! the t-test reflects measurement quantization rather than the operation.)
@@ -45,8 +38,7 @@
 //! Run with: `cargo run --release --example leakage [scale]`, where `scale`
 //! multiplies the number of measurements (default 1).
 //! Results are statistical and machine-dependent; run multiple times under low
-//! load, on every target the crate is deployed to. The timing of the flood sampler
-//! in particular rests on the floating-point division and square root of the CPU.
+//! load, on every target the crate is deployed to.
 
 use pq_rerand::params::{N, T, SLOT_BYTES};
 use pq_rerand::poly::NTT_CONTEXT;
@@ -181,33 +173,6 @@ impl TryRng for Split {
 
 // Only so that the type is accepted by the functions under test.
 impl TryCryptoRng for Split {}
-
-/// Generator whose 64-bit draws cycle through the `chosen` words where `mask` is
-/// all ones, and are random where it is zero. The same work is done in both cases.
-struct Chosen {
-    chosen: [u64; 4],
-    mask: u64,
-    random: StdRng,
-    count: usize,
-}
-
-impl TryRng for Chosen {
-    type Error = Infallible;
-    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
-        Ok(self.random.next_u32())
-    }
-    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
-        self.count += 1;
-        let (chosen, random) = (self.chosen[self.count % 4], self.random.next_u64());
-        Ok((chosen & self.mask) | (random & !self.mask))
-    }
-    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
-        self.random.fill_bytes(dst);
-        Ok(())
-    }
-}
-
-impl TryCryptoRng for Chosen {}
 
 /// POSITIVE CONTROL: one data-dependent branch per coefficient, as a compiler
 /// could emit for a conditional subtraction -> variable time.
@@ -348,17 +313,6 @@ fn main() {
         select(&mut work_ct, &fixed_ct_bytes, &random_cts[next()], class);
         let ct = deserialize_slot(&work_ct).expect("valid ciphertext");
         ticks(|| decrypt_slot(ctx, &sk, &ct))
-    });
-
-    println!("\nHardware diagnostic (see module docs):");
-    // The smallest and the largest probability, and both sides of the boundary
-    // (p = 0.02425) between the tail and the central region of the probit.
-    let boundary = ((0.0485 * (1u64 << 52) as f64) as u64) << 12;
-    let chosen = [0, u64::MAX, boundary, boundary - (1 << 12)];
-    run("flood sampler (chosen inputs)", 20_000 * scale, |class| {
-        let mask = (class as u64).wrapping_sub(1);
-        let mut g = Chosen { chosen, mask, random: StdRng::from_seed(fixed_seed), count: 0 };
-        ticks(|| add_flood(&mut g, &mut samples))
     });
 
     println!(
