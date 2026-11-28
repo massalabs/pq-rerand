@@ -2,20 +2,21 @@
 
 use chacha20::ChaCha20Rng;
 use pq_rerand::params::*;
-use pq_rerand::poly::NTT_CONTEXT;
-use pq_rerand::keygen::{keygen, PublicKey, SecretKey};
-use pq_rerand::encrypt::{encrypt_slot, Flooding};
-use pq_rerand::decrypt::decrypt_slot;
-use pq_rerand::rerandomize::rerandomize_slot;
-use pq_rerand::encoding::{encode, decode};
-use pq_rerand::serialize::{serialize_slot, deserialize_slot};
+use pq_rerand::{decrypt_slot, encrypt_slot, keygen, rerandomize_slot};
+use pq_rerand::{CiphertextSlot, Flooding, PublicKey, SecretKey};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
 fn setup() -> (SecretKey, PublicKey, StdRng) {
     let mut rng = StdRng::seed_from_u64(42);
-    let (sk, pk) = keygen(&mut rng, &NTT_CONTEXT);
+    let (sk, pk) = keygen(&mut rng);
     (sk, pk, rng)
+}
+
+/// The payload that `ct` decrypts to, accepted as it is. Only a test may do
+/// that: an application authenticates the payload here.
+fn payload(sk: &SecretKey, ct: &CiphertextSlot) -> Option<[u8; SLOT_BYTES]> {
+    decrypt_slot(sk, ct, |payload| Some(*payload))
 }
 
 fn random_slot(rng: &mut StdRng) -> [u8; SLOT_BYTES] {
@@ -27,8 +28,8 @@ fn random_slot(rng: &mut StdRng) -> [u8; SLOT_BYTES] {
 /// Encrypt `data`, decrypt it and compare.
 fn roundtrip(data: &[u8; SLOT_BYTES], flood: Flooding) {
     let (sk, pk, mut rng) = setup();
-    let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(data), flood);
-    let recovered = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct)).expect("decryption failed");
+    let ct = encrypt_slot(&mut rng, &pk, data, flood);
+    let recovered = payload(&sk, &ct).expect("decryption failed");
     assert_eq!(data[..], recovered[..]);
 }
 
@@ -58,9 +59,9 @@ fn test_encrypt_decrypt_max_values() {
 fn test_rerand_preserves_plaintext() {
     let (sk, pk, mut rng) = setup();
     let data = random_slot(&mut rng);
-    let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(&data), Flooding::Standard);
-    let ct2 = rerandomize_slot(&mut rng, &NTT_CONTEXT, &pk, &ct);
-    let recovered = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct2)).expect("rerand broke plaintext");
+    let ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Standard);
+    let ct2 = rerandomize_slot(&mut rng, &pk, &ct);
+    let recovered = payload(&sk, &ct2).expect("rerand broke plaintext");
     assert_eq!(data[..], recovered[..], "rerand broke plaintext");
 }
 
@@ -68,12 +69,12 @@ fn test_rerand_preserves_plaintext() {
 fn test_multiple_rerands() {
     let (sk, pk, mut rng) = setup();
     let data = random_slot(&mut rng);
-    let mut ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(&data), Flooding::Standard);
+    let mut ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Standard);
     // Apply 100 re-randomizations
     for _ in 0..100 {
-        ct = rerandomize_slot(&mut rng, &NTT_CONTEXT, &pk, &ct);
+        ct = rerandomize_slot(&mut rng, &pk, &ct);
     }
-    let recovered = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct)).expect("100 rerands broke plaintext");
+    let recovered = payload(&sk, &ct).expect("100 rerands broke plaintext");
     assert_eq!(data[..], recovered[..], "100 rerands broke plaintext");
 }
 
@@ -82,19 +83,35 @@ fn test_encrypt_decrypt_no_flood() {
     // Flooding is optional (paper section 6) and is disabled explicitly.
     let (sk, pk, mut rng) = setup();
     let data = random_slot(&mut rng);
-    let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(&data), Flooding::Off);
-    let ct2 = rerandomize_slot(&mut rng, &NTT_CONTEXT, &pk, &ct);
-    let recovered = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct2)).expect("no-flood roundtrip failed");
+    let ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Off);
+    let ct2 = rerandomize_slot(&mut rng, &pk, &ct);
+    let recovered = payload(&sk, &ct2).expect("no-flood roundtrip failed");
     assert_eq!(data[..], recovered[..], "no-flood roundtrip failed");
+}
+
+/// The single-slot operations run on a thread that asks for a stack of 16 KiB,
+/// which the C library may round up: keys, ciphertexts, randomness and the
+/// payload of a decryption live on the heap.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "frames are larger without optimizations")]
+fn test_single_slot_operations_fit_a_small_stack() {
+    let data = Box::new(random_slot(&mut StdRng::seed_from_u64(7)));
+    let thread = std::thread::Builder::new().stack_size(16 * 1024).spawn(move || {
+        let (sk, pk, mut rng) = setup();
+        let ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Standard);
+        let ct = rerandomize_slot(&mut rng, &pk, &ct);
+        decrypt_slot(&sk, &ct, |payload| (payload == &*data).then_some(())).is_some()
+    });
+    assert!(thread.unwrap().join().unwrap());
 }
 
 #[test]
 fn test_serialization_roundtrip_via_crypto() {
     let (sk, pk, mut rng) = setup();
     let data = random_slot(&mut rng);
-    let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(&data), Flooding::Standard);
-    let ct2 = deserialize_slot(&serialize_slot(&ct)).expect("valid ciphertext rejected");
-    let recovered = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct2)).expect("valid slot");
+    let ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Standard);
+    let ct2 = CiphertextSlot::from_bytes(&ct.to_bytes()).expect("valid ciphertext rejected");
+    let recovered = payload(&sk, &ct2).expect("valid slot");
     assert_eq!(data[..], recovered[..], "serialize -> deserialize -> decrypt failed");
 }
 
@@ -113,37 +130,24 @@ fn test_key_serialization_rejects_out_of_range() {
     assert!(SecretKey::from_bytes(&bad).is_none(), "out-of-range sk accepted");
 }
 
-#[test]
-fn test_encoding_roundtrip_via_crypto() {
-    let (sk, pk, mut rng) = setup();
-    // Create a realistic plaintext slot from bytes
-    let data = random_slot(&mut rng);
-    let message = encode(&data);
-    let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &message, Flooding::Standard);
-    let ct2 = rerandomize_slot(&mut rng, &NTT_CONTEXT, &pk, &ct);
-    let recovered = decrypt_slot(&NTT_CONTEXT, &sk, &ct2);
-    let decoded = decode(&recovered).expect("valid slot");
-    assert_eq!(data[..], decoded[..], "full encode -> encrypt -> rerand -> decrypt -> decode roundtrip failed");
-}
-
 /// Keys that went through their serialized form work like the originals, and a
 /// stored public key is checked against its secret key.
 #[test]
 fn test_roundtrip_with_many_keys() {
     for seed in 0..8 {
         let mut rng = StdRng::seed_from_u64(seed);
-        let (sk, pk) = keygen(&mut rng, &NTT_CONTEXT);
+        let (sk, pk) = keygen(&mut rng);
         let sk = SecretKey::from_bytes(&sk.to_bytes()).expect("valid secret key rejected");
         let pk = PublicKey::from_bytes(&pk.to_bytes()).expect("valid public key rejected");
         assert!(pk.verify_against(&sk));
 
         let data = random_slot(&mut rng);
         let flood = if seed % 2 == 0 { Flooding::Standard } else { Flooding::Off };
-        let mut ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(&data), flood);
+        let mut ct = encrypt_slot(&mut rng, &pk, &data, flood);
         for _ in 0..3 {
-            ct = rerandomize_slot(&mut rng, &NTT_CONTEXT, &pk, &ct);
+            ct = rerandomize_slot(&mut rng, &pk, &ct);
         }
-        let recovered = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct)).expect("valid slot");
+        let recovered = payload(&sk, &ct).expect("valid slot");
         assert_eq!(data[..], recovered[..], "seed {seed}");
     }
 }
@@ -153,14 +157,14 @@ fn test_roundtrip_with_many_keys() {
 #[test]
 fn test_wrong_key_does_not_decrypt() {
     let (sk, pk, mut rng) = setup();
-    let (other_sk, other_pk) = keygen(&mut rng, &NTT_CONTEXT);
+    let (other_sk, other_pk) = keygen(&mut rng);
     assert!(!pk.verify_against(&other_sk));
     assert!(!other_pk.verify_against(&sk));
     let data = random_slot(&mut rng);
     let mut rejected = 0;
     for _ in 0..64 {
-        let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(&data), Flooding::Standard);
-        match decode(&decrypt_slot(&NTT_CONTEXT, &other_sk, &ct)) {
+        let ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Standard);
+        match payload(&other_sk, &ct) {
             None => rejected += 1,
             Some(garbage) => assert_ne!(data[..], garbage[..]),
         }
@@ -171,13 +175,13 @@ fn test_wrong_key_does_not_decrypt() {
 
 /// Random and perturbed inputs to the three parsers: an input of the wrong length,
 /// of another version or with an unreduced coefficient is rejected, and whatever
-/// parses as a ciphertext decrypts and decodes without a panic (in debug builds:
-/// without an arithmetic overflow).
+/// parses as a ciphertext decrypts without a panic (in debug builds: without an
+/// arithmetic overflow).
 #[test]
 fn test_parsers_on_random_inputs() {
     let (sk, pk, mut rng) = setup();
-    let message = encode(&random_slot(&mut rng));
-    let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &message, Flooding::Standard);
+    let data = random_slot(&mut rng);
+    let ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Standard);
     // In all three formats, the limbs alternate between t and q2. They follow the
     // version byte of a key (a slot has none): `header` below.
     let reduced = |data: &[u8]| {
@@ -188,7 +192,7 @@ fn test_parsers_on_random_inputs() {
     let parsers: [(Vec<u8>, Parser); 3] = [
         (pk.to_bytes(), |data| PublicKey::from_bytes(data).is_some()),
         (sk.to_bytes().to_vec(), |data| SecretKey::from_bytes(data).is_some()),
-        (serialize_slot(&ct), |data| deserialize_slot(data).is_some()),
+        (ct.to_bytes(), |data| CiphertextSlot::from_bytes(data).is_some()),
     ];
     let mut accepted = 0;
     for round in 0..300 {
@@ -215,8 +219,8 @@ fn test_parsers_on_random_inputs() {
             let well_formed = || data[..header] == good[..header] && reduced(&data[header..]);
             assert!(!valid || (data.len() == good.len() && well_formed()), "round {round}: invalid input accepted");
             accepted += valid as usize;
-            if let Some(ct) = deserialize_slot(&data) {
-                let _ = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct));
+            if let Some(ct) = CiphertextSlot::from_bytes(&data) {
+                let _ = payload(&sk, &ct);
             }
         }
     }
@@ -243,15 +247,15 @@ fn test_known_answers() {
     ];
     let got = vectors.map(|(seed, _)| {
         let mut rng = ChaCha20Rng::from_seed([seed; 32]);
-        let (sk, pk) = keygen(&mut rng, &NTT_CONTEXT);
+        let (sk, pk) = keygen(&mut rng);
         let data: [u8; SLOT_BYTES] = std::array::from_fn(|i| (i as u8).wrapping_mul(seed).wrapping_add(seed));
-        let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &encode(&data), Flooding::Standard);
-        let rerandomized = rerandomize_slot(&mut rng, &NTT_CONTEXT, &pk, &ct);
+        let ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Standard);
+        let rerandomized = rerandomize_slot(&mut rng, &pk, &ct);
         let digests = [
             digest(&pk.to_bytes()[1..]),
             digest(&sk.to_bytes()[1..]),
-            digest(&serialize_slot(&ct)),
-            digest(&serialize_slot(&rerandomized)),
+            digest(&ct.to_bytes()),
+            digest(&rerandomized.to_bytes()),
         ];
         (seed, digests)
     });

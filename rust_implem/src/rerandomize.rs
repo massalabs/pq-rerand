@@ -2,7 +2,6 @@
 
 use crate::params::{T, Q2};
 use crate::ntt::pointwise_add;
-use crate::poly::NttContext;
 use crate::keygen::PublicKey;
 use crate::encrypt::{CiphertextSlot, Flooding, encrypt_zero};
 use crate::sampling::wiped;
@@ -30,13 +29,12 @@ use rand_core::{CryptoRng, Rng};
 /// and encrypting it again, before the limit.
 pub fn rerandomize_slot<R: Rng + CryptoRng>(
     rng: &mut R,
-    ctx: &NttContext,
     pk: &PublicKey,
     ct: &CiphertextSlot,
 ) -> CiphertextSlot {
     // Enc(0) = (b*r + e2, a*r + e1) in each limb, written straight to the output.
     let mut out = CiphertextSlot::zeroed();
-    wiped(|| encrypt_zero(rng, ctx, pk, Flooding::Off, &mut out));
+    wiped(|| encrypt_zero(rng, pk, Flooding::Off, &mut out));
 
     // c0' = c0 + b*r + e2
     pointwise_add(&mut out.c0_t, &ct.c0_t, T);

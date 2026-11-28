@@ -28,26 +28,23 @@
 //! the source. On x86 it also depends on the CPU, as the generator selects its
 //! code at run time. The exit status is zero only if nothing was found.
 
-// The transform of the library, compiled into this program as well, to compute
-// the transformed values that are searched for.
+// The transform and the samplers of the library, compiled into this program as
+// well, to compute the values that are searched for and to run the flood sampler
+// on its own.
 #[allow(dead_code)]
 #[path = "../src/ntt.rs"]
 mod ntt;
+#[allow(dead_code)]
+#[path = "../src/sampling.rs"]
+mod sampling;
 mod params {
     pub use pq_rerand::params::*;
 }
 
 use chacha20::ChaCha20Rng;
-use pq_rerand::batch::{decrypt_batch, encrypt_batch, rerandomize_batch};
-use pq_rerand::decrypt::decrypt_slot;
-use pq_rerand::encoding::{decode, encode, Plaintext};
-use pq_rerand::encrypt::{encrypt_slot, CiphertextSlot, Flooding};
-use pq_rerand::keygen::{keygen, PublicKey, SecretKey};
 use pq_rerand::params::{BITS_PER_COEFF, DELTA_T, N, Q2, SLOT_BYTES, T};
-use pq_rerand::poly::NTT_CONTEXT;
-use pq_rerand::rerandomize::rerandomize_slot;
-use pq_rerand::sampling::{add_flood, sample_gaussian_cdt};
-use pq_rerand::serialize::{deserialize_slot, serialize_slot};
+use pq_rerand::{decrypt_batch, decrypt_slot, encrypt_batch, encrypt_slot, keygen, rerandomize_batch, rerandomize_slot};
+use pq_rerand::{CiphertextSlot, Flooding, PublicKey, SecretKey};
 use rand_core::{Rng, SeedableRng};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -55,6 +52,7 @@ use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
+use sampling::{add_flood, sample_gaussian_cdt};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Freed memory is never handed out again: a buffer that was freed without being
@@ -361,7 +359,7 @@ fn register_key(scanner: &mut Scanner, sk: &SecretKey, pk: &PublicKey) -> [usize
 /// and in the coefficient domain, and the noisy plaintext `c0 - c1*s`.
 #[inline(never)]
 fn register_product(scanner: &mut Scanner, key: usize, ct: &CiphertextSlot) {
-    let ct_bytes = serialize_slot(ct);
+    let ct_bytes = ct.to_bytes();
     for (i, tables) in TABLES.iter().enumerate() {
         let p = tables.modulus;
         let (mut s, mut c1, mut v) = (limb(scanner.bytes(key), i), limb(&ct_bytes, 2 + i), limb(&ct_bytes, i));
@@ -380,7 +378,7 @@ fn register_product(scanner: &mut Scanner, key: usize, ct: &CiphertextSlot) {
 /// added: it links the two.
 #[inline(never)]
 fn register_added(scanner: &mut Scanner, fresh: &CiphertextSlot, ct: &CiphertextSlot) {
-    let (fresh_bytes, ct_bytes) = (serialize_slot(fresh), serialize_slot(ct));
+    let (fresh_bytes, ct_bytes) = (fresh.to_bytes(), ct.to_bytes());
     for i in 0..4 {
         let mut added = limb(&ct_bytes, i);
         ntt::pointwise_sub(&mut added, &limb(&fresh_bytes, i), TABLES[i % 2].modulus);
@@ -394,7 +392,10 @@ struct Session {
 }
 
 fn main() {
-    let ctx = &NTT_CONTEXT;
+    // The first unwinding of a process resolves the symbols of the unwinder, and
+    // the dynamic loader saves the registers on the stack to do so: it happens
+    // here, before there is any secret.
+    let _ = std::panic::catch_unwind(|| std::panic::resume_unwind(Box::new(())));
     let mut scanner = Scanner::new();
     let mut kept = Vec::new();
     let payload = scanner.add("payload", 32, (0..SLOT_BYTES).map(|i| byte(0, i)));
@@ -404,7 +405,7 @@ fn main() {
     let embedded = |c: usize| (DELTA_T as u64 * coefficient(c) as u64 % T as u64) as u32;
     scanner.add("plaintext: Delta_t * M mod t", 16, (0..N).flat_map(|c| embedded(c).to_le_bytes()));
 
-    let (sk, pk) = isolated(&mut kept, 1, || keygen(&mut *generator(1), ctx));
+    let (sk, pk) = isolated(&mut kept, 1, || keygen(&mut *generator(1)));
     drop(isolated(&mut kept, 1, || sk.to_bytes()));
     register_randomness(&mut scanner, &pk);
     let [key, transformed] = register_key(&mut scanner, &sk, &pk);
@@ -420,46 +421,53 @@ fn main() {
 
     // One slot: encrypt, re-randomize, check the public key, drop the key.
     let slot: &[u8; SLOT_BYTES] = scanner.bytes(payload).try_into().unwrap();
-    let message = isolated(&mut kept, 1, || encode(slot));
-    let fresh = isolated(&mut kept, 1, || encrypt_slot(&mut *generator(2), ctx, &pk, &message, Flooding::Standard));
-    let ct = isolated(&mut kept, 1, || rerandomize_slot(&mut *generator(3), ctx, &pk, &fresh));
+    let fresh = isolated(&mut kept, 1, || encrypt_slot(&mut *generator(2), &pk, slot, Flooding::Standard));
+    let ct = isolated(&mut kept, 1, || rerandomize_slot(&mut *generator(3), &pk, &fresh));
     // The flood sampler on its own, outside the wiped frame of an encryption.
     isolated(&mut kept, 1, || add_flood(&mut *generator(3), &mut zeros()));
     assert!(isolated(&mut kept, 1, || pk.verify_against(&sk)));
     drop(isolated(&mut kept, 1, || sk.clone()));
-    drop((sk, message));
+    drop(sk);
 
     // The life of a stored key: open a session from the stored bytes, read, move
-    // the session, read again, lock.
+    // the session, read again, lock. A read compares the payload in place: like
+    // an application, it takes no copy of a payload out of a decryption.
     let stored = scanner.bytes(key);
     let session = Session { sk: isolated(&mut kept, 1, || SecretKey::from_bytes(stored)).expect("valid key") };
     let read = |kept: &mut Vec<ThreadPool>, session: &Session| {
-        let message = isolated(kept, 1, || decrypt_slot(ctx, &session.sk, &ct));
-        isolated(kept, 1, || decode(&message)).expect("valid slot")[..] == slot[..]
+        isolated(kept, 1, || decrypt_slot(&session.sk, &ct, |payload| (payload == slot).then_some(()))).is_some()
     };
     assert!(read(&mut kept, &session));
     let session = Box::new(session);
     assert!(read(&mut kept, &session));
+    // An `open` that panics: the payload is cleared on the way out as well. The
+    // panic is caught on the thread of the call, which is kept like the others.
+    let unwinding = || {
+        let open = |_: &mut [u8; SLOT_BYTES]| -> Option<()> { std::panic::resume_unwind(Box::new(())) };
+        std::panic::catch_unwind(|| decrypt_slot(&session.sk, &ct, open)).is_err()
+    };
+    assert!(isolated(&mut kept, 1, unwinding));
 
     // Batch calls, each on four threads.
-    let messages: Vec<Plaintext> = isolated(&mut kept, 1, || (0..SLOTS).map(|_| encode(slot)).collect());
-    let cts = isolated(&mut kept, 4, || encrypt_batch(&mut *generator(4), ctx, &pk, &messages, Flooding::Standard));
-    let cts = isolated(&mut kept, 4, || rerandomize_batch(&mut *generator(5), ctx, &pk, &cts));
-    let decrypted = isolated(&mut kept, 4, || decrypt_batch(ctx, &session.sk, &cts));
-    assert!(isolated(&mut kept, 1, || decrypted.iter().all(|m| decode(m).expect("valid slot")[..] == slot[..])));
+    let mut payloads = Zeroizing::new(vec![[0u8; SLOT_BYTES]; SLOTS]);
+    payloads.iter_mut().for_each(|payload| payload.copy_from_slice(slot));
+    let cts = isolated(&mut kept, 4, || encrypt_batch(&mut *generator(4), &pk, &payloads, Flooding::Standard));
+    let cts = isolated(&mut kept, 4, || rerandomize_batch(&mut *generator(5), &pk, &cts));
+    let all_read = |payloads: &mut [[u8; SLOT_BYTES]]| payloads.iter().all(|payload| payload == slot).then_some(());
+    assert!(isolated(&mut kept, 4, || decrypt_batch(&session.sk, &cts, all_read)).is_some());
 
-    // A slot that decode rejects: coefficient 0 raised to 2^31.
-    let mut tampered = serialize_slot(&ct);
+    // A slot that does not decrypt to a payload: coefficient 0 raised to 2^31.
+    // Its decryption fails although `open` accepts.
+    let mut tampered = ct.to_bytes();
     let c0 = u32::from_le_bytes(tampered[..4].try_into().unwrap()) as u64;
     let shift = DELTA_T as u64 * ((1 << 31) - coefficient(0) as u64) % T as u64;
     tampered[..4].copy_from_slice(&(((c0 + shift) % T as u64) as u32).to_le_bytes());
-    let tampered = deserialize_slot(&tampered).expect("reduced");
-    let rejected = isolated(&mut kept, 1, || decrypt_slot(ctx, &session.sk, &tampered));
-    assert!(isolated(&mut kept, 1, || decode(&rejected)).is_none());
-    drop((session, messages, decrypted, rejected));
+    let tampered = CiphertextSlot::from_bytes(&tampered).expect("reduced");
+    assert!(isolated(&mut kept, 1, || decrypt_slot(&session.sk, &tampered, |_| Some(()))).is_none());
+    drop((session, payloads));
 
     // The encryption of zero that the message was added to: its first limb.
-    let c0 = limb(&serialize_slot(&fresh), 0);
+    let c0 = limb(&fresh.to_bytes(), 0);
     let zero = (0..N).flat_map(|c| ntt::submod(c0[c], embedded(c), T).to_le_bytes());
     scanner.add("encryption: c0 - Delta_t * M mod t", 16, zero);
     register_product(&mut scanner, key, &ct);

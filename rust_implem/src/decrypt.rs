@@ -4,28 +4,83 @@
 //! Center-lift it to recover the signed noise, then subtract from the t-limb
 //! and multiply by INV_DELTA_T to recover M.
 
-use crate::params::{N, T, Q2, INV_DELTA_T, NOISE_THRESHOLD};
+use crate::params::{N, T, Q2, INV_DELTA_T, NOISE_THRESHOLD, SLOT_BYTES};
 use crate::ntt::{barrett_mu, barrett_reduce, csub, pointwise_mul, submod};
-use crate::poly::{NttContext, secret};
-use crate::encoding::Plaintext;
+use crate::poly::{NTT_CONTEXT, secret};
+use crate::encoding::{Plaintext, decode};
 use crate::keygen::SecretKey;
 use crate::encrypt::CiphertextSlot;
-use core::hint::select_unpredictable;
+use core::hint::{black_box, select_unpredictable};
+use zeroize::Zeroize;
 
-/// Decrypt a single ciphertext slot, returning the message polynomial
-/// coefficients in [0, t).
+/// Decrypt a single ciphertext slot and pass its payload to `open`, which
+/// authenticates it. Returns what `open` returns, or `None` if the slot did not
+/// decrypt to a payload.
 ///
-/// The result is only the plaintext that was encrypted if the ciphertext is
-/// authentic. For a ciphertext that someone crafted or modified it can be a
-/// function of the secret key (for instance its negation): treat it as key
-/// material until the payload it carries has been authenticated, and never
-/// reveal it. It is returned in heap storage that is zeroized on drop, as are the
-/// intermediate values. See the crate documentation on decryption outcomes.
-pub fn decrypt_slot(
-    ctx: &NttContext,
+/// `open` is the authenticated decryption of the application (see the crate
+/// documentation): it must return `None` unless the payload authenticates, and
+/// what it returns is all that leaves this function. The payload that it
+/// receives is not authentic yet: for a ciphertext that someone crafted or
+/// modified it can be a function of the secret key (for instance a constant
+/// minus the key). `open` may work in the buffer that it is given, as an AEAD
+/// that decrypts in place does: like the intermediate values, that buffer only
+/// exists in heap storage that is zeroized before returning.
+///
+/// A slot that did not decrypt to a payload (wrong key, modified ciphertext,
+/// exhausted noise budget) is not reported apart from one that `open` rejects:
+/// `open` still runs, on a slot of zeros, and its result is discarded. The two
+/// cases give the same `None` after the same work, provided that the time `open`
+/// takes to reject does not depend on its input. That a call failed at all is
+/// still an outcome to hide: see the crate documentation.
+pub fn decrypt_slot<T>(
     sk: &SecretKey,
     ct: &CiphertextSlot,
-) -> Plaintext {
+    open: impl FnOnce(&mut [u8; SLOT_BYTES]) -> Option<T>,
+) -> Option<T> {
+    let mut payload = Payloads::new(1);
+    let payload = &mut payload.slots()[0];
+    let valid = decrypt_into(sk, ct, payload);
+    // The verdict is read inside the closure, through `black_box`: only once
+    // `open` has accepted. A compiler is otherwise free to test it before the
+    // answer of `open`, in a decryption that fails.
+    open(payload).filter(|_| black_box(valid))
+}
+
+/// Heap storage for the payloads of decrypted slots, zeroized on drop.
+pub(crate) struct Payloads(Vec<u8>);
+
+impl Payloads {
+    /// Zeroed storage for `slots` payloads. It is allocated as bytes: a vector of
+    /// slots can be built from a slot on the stack.
+    pub(crate) fn new(slots: usize) -> Self {
+        Payloads(vec![0; slots.checked_mul(SLOT_BYTES).expect("capacity overflow")])
+    }
+
+    /// The payloads, slot by slot.
+    pub(crate) fn slots(&mut self) -> &mut [[u8; SLOT_BYTES]] {
+        self.0.as_chunks_mut().0
+    }
+}
+
+impl Drop for Payloads {
+    fn drop(&mut self) {
+        // As a slice, the form that `zeroize` clears fastest. The vector has no
+        // spare capacity to clear.
+        self.0.as_mut_slice().zeroize();
+    }
+}
+
+/// Decrypt `ct` into `payload`. Returns whether it decrypted to a payload: if
+/// not, `payload` is all zero (see [`decode`]).
+pub(crate) fn decrypt_into(sk: &SecretKey, ct: &CiphertextSlot, payload: &mut [u8; SLOT_BYTES]) -> bool {
+    decode(&decrypt_message(sk, ct), payload)
+}
+
+/// The message polynomial that `ct` decrypts to, with coefficients in [0, t).
+/// It is returned in heap storage that is zeroized on drop, as are the
+/// intermediate values.
+fn decrypt_message(sk: &SecretKey, ct: &CiphertextSlot) -> Plaintext {
+    let ctx = &NTT_CONTEXT;
     // Compute c1 * s in each limb via NTT. c1 is in coefficient domain, so it is
     // forward-transformed here; s is already cached in the NTT domain (see
     // `SecretKey`), saving two forward transforms per decryption.
@@ -68,11 +123,11 @@ pub fn decrypt_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoding::{decode, encode};
+    use crate::encoding::encode;
     use crate::encrypt::{Flooding, encrypt_slot};
     use crate::keygen::keygen;
-    use crate::params::{DELTA_T, SIGMA, SIGMA_FLOOD, SLOT_BYTES};
-    use crate::poly::NTT_CONTEXT;
+    use crate::ntt::addmod;
+    use crate::params::{DELTA_T, SIGMA, SIGMA_FLOOD};
     use crate::rerandomize::rerandomize_slot;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -99,7 +154,7 @@ mod tests {
     /// off by one unit of the plaintext just beyond, on either side.
     #[test]
     fn noise_threshold_is_exact() {
-        let (sk, _pk) = keygen(&mut StdRng::seed_from_u64(1), &NTT_CONTEXT);
+        let (sk, _pk) = keygen(&mut StdRng::seed_from_u64(1));
         let data: [u8; SLOT_BYTES] = std::array::from_fn(|i| (i * 29 + 5) as u8);
         let message = encode(&data);
         let half = NOISE_THRESHOLD as i64;
@@ -118,7 +173,7 @@ mod tests {
             ct.c0_t[i] = (embedded + nu).rem_euclid(T as i64) as u32;
             ct.c0_q2[i] = nu.rem_euclid(Q2 as i64) as u32;
         }
-        let out = decrypt_slot(&NTT_CONTEXT, &sk, &ct);
+        let out = decrypt_message(&sk, &ct);
         for i in 0..N {
             let want = (message.0[i] as i64 + cases[i % cases.len()].1).rem_euclid(T as i64);
             assert_eq!(out.0[i] as i64, want, "coefficient {i}, noise {}", cases[i % cases.len()].0);
@@ -130,16 +185,44 @@ mod tests {
     #[test]
     fn flooding_sets_the_noise_width() {
         let mut rng = StdRng::seed_from_u64(2);
-        let (sk, pk) = keygen(&mut rng, &NTT_CONTEXT);
-        let message = encode(&[0x5a; SLOT_BYTES]);
+        let (sk, pk) = keygen(&mut rng);
+        let data = [0x5a; SLOT_BYTES];
         let key_norm = SIGMA * (2.0 * N as f64).sqrt();
         for (flood, width) in [(Flooding::Off, SIGMA), (Flooding::Standard, SIGMA_FLOOD)] {
-            let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &message, flood);
+            let ct = encrypt_slot(&mut rng, &pk, &data, flood);
             let ratio = std_dev(&noise(&sk, &ct)) / (width * key_norm);
             assert!((0.9..1.1).contains(&ratio), "{flood:?}: noise is {ratio} times the expected width");
-            let decoded = decode(&decrypt_slot(&NTT_CONTEXT, &sk, &ct)).expect("valid slot");
-            assert!(decoded.iter().all(|&b| b == 0x5a));
+            assert!(decrypt_slot(&sk, &ct, |payload| Some(*payload)) == Some(data));
         }
+    }
+
+    /// One failure: `open` rejecting the payload, or a slot that did not decrypt
+    /// to one, which `open` then sees as zeros and which fails whatever `open`
+    /// answers.
+    #[test]
+    fn decryption_has_one_failure() {
+        let mut rng = StdRng::seed_from_u64(4);
+        let (sk, pk) = keygen(&mut rng);
+        let data: [u8; SLOT_BYTES] = std::array::from_fn(|i| (i * 31 + 7) as u8);
+        let mut ct = encrypt_slot(&mut rng, &pk, &data, Flooding::Standard);
+        // What `open` is given, and the outcome when it accepts.
+        let accepted = |ct: &CiphertextSlot| {
+            let mut given = [0xaa; SLOT_BYTES];
+            let outcome = decrypt_slot(&sk, ct, |payload| {
+                given = *payload;
+                Some(())
+            });
+            (outcome, given)
+        };
+        assert!(accepted(&ct) == (Some(()), data));
+        assert_eq!(decrypt_slot(&sk, &ct, |_| None::<()>), None);
+
+        // The last coefficient of the message, m, is moved to t - 1, which is not
+        // below 2^31, by adding Delta_t * (t - 1 - m) to c0 in the t limb.
+        let m = encode(&data).0[N - 1];
+        let shift = (DELTA_T as u64 * (T - 1 - m) as u64 % T as u64) as u32;
+        ct.c0_t[N - 1] = addmod(ct.c0_t[N - 1], shift, T);
+        assert!(accepted(&ct) == (None, [0; SLOT_BYTES]));
     }
 
     /// Re-randomization changes every component of the ciphertext beyond
@@ -147,10 +230,9 @@ mod tests {
     #[test]
     fn rerandomization_adds_narrow_noise() {
         let mut rng = StdRng::seed_from_u64(3);
-        let (sk, pk) = keygen(&mut rng, &NTT_CONTEXT);
-        let message = encode(&[0xa5; SLOT_BYTES]);
-        let ct = encrypt_slot(&mut rng, &NTT_CONTEXT, &pk, &message, Flooding::Standard);
-        let ct2 = rerandomize_slot(&mut rng, &NTT_CONTEXT, &pk, &ct);
+        let (sk, pk) = keygen(&mut rng);
+        let ct = encrypt_slot(&mut rng, &pk, &[0xa5; SLOT_BYTES], Flooding::Standard);
+        let ct2 = rerandomize_slot(&mut rng, &pk, &ct);
 
         let added: Vec<i64> = noise(&sk, &ct2).iter().zip(noise(&sk, &ct)).map(|(a, b)| a - b).collect();
         let ratio = std_dev(&added) / (SIGMA * SIGMA * (2.0 * N as f64).sqrt());

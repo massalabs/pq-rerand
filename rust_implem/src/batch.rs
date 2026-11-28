@@ -1,21 +1,14 @@
 //! Multi-threaded batch operations.
-//!
-//! Batch encryption, re-randomization and decryption are embarrassingly parallel
-//! across ciphertext slots. These helpers fan the per-slot work out across the
-//! current rayon thread pool (the global one, or the pool the call is made in
-//! through `ThreadPool::install`). Every slot draws its randomness from its own
-//! ChaCha20 generator, keyed with 256 fresh bits of the caller's generator and
-//! zeroized after use.
 
-use crate::poly::NttContext;
+use crate::params::SLOT_BYTES;
 use crate::sampling::wiped;
-use crate::encoding::Plaintext;
 use crate::keygen::{PublicKey, SecretKey};
 use crate::encrypt::{encrypt_slot, CiphertextSlot, Flooding};
 use crate::rerandomize::rerandomize_slot;
-use crate::decrypt::decrypt_slot;
+use crate::decrypt::{Payloads, decrypt_into};
 use chacha20::ChaCha20Rng;
 use rand_core::{CryptoRng, Rng, SeedableRng};
+use core::hint::black_box;
 use rayon::prelude::*;
 use zeroize::Zeroizing;
 
@@ -32,22 +25,27 @@ fn slot_rngs<R: Rng + CryptoRng>(rng: &mut R, slots: usize) -> Vec<ChaCha20Rng> 
     })
 }
 
-/// Encrypt a batch of plaintext slots in parallel.
+/// Encrypt a batch of payload slots in parallel.
 ///
 /// `rng` must be cryptographically secure, like for [`encrypt_slot`]; `flood`
 /// selects the flood packet.
+///
+/// Like the other batch functions, this one fans the per-slot work out across
+/// the current rayon thread pool (the global one, or the pool the call is made
+/// in through `ThreadPool::install`). Every slot draws its randomness from its
+/// own ChaCha20 generator, keyed with 256 fresh bits of `rng` and zeroized after
+/// use, here and in [`rerandomize_batch`].
 pub fn encrypt_batch<R: Rng + CryptoRng>(
     rng: &mut R,
-    ctx: &NttContext,
     pk: &PublicKey,
-    messages: &[Plaintext],
+    payloads: &[[u8; SLOT_BYTES]],
     flood: Flooding,
 ) -> Vec<CiphertextSlot> {
-    let mut rngs = slot_rngs(rng, messages.len());
-    messages
+    let mut rngs = slot_rngs(rng, payloads.len());
+    payloads
         .par_iter()
         .zip(rngs.par_iter_mut())
-        .map(|(m, slot_rng)| encrypt_slot(slot_rng, ctx, pk, m, flood))
+        .map(|(payload, slot_rng)| encrypt_slot(slot_rng, pk, payload, flood))
         .collect()
 }
 
@@ -58,36 +56,47 @@ pub fn encrypt_batch<R: Rng + CryptoRng>(
 /// responsibility.
 pub fn rerandomize_batch<R: Rng + CryptoRng>(
     rng: &mut R,
-    ctx: &NttContext,
     pk: &PublicKey,
     cts: &[CiphertextSlot],
 ) -> Vec<CiphertextSlot> {
     let mut rngs = slot_rngs(rng, cts.len());
     cts.par_iter()
         .zip(rngs.par_iter_mut())
-        .map(|(ct, slot_rng)| rerandomize_slot(slot_rng, ctx, pk, ct))
+        .map(|(ct, slot_rng)| rerandomize_slot(slot_rng, pk, ct))
         .collect()
 }
 
-/// Decrypt a batch of ciphertext slots in parallel.
+/// Decrypt a batch of ciphertext slots in parallel and pass their payloads, in
+/// order, to `open`, which authenticates them. Returns what `open` returns, or
+/// `None` if a slot did not decrypt to a payload.
 ///
-/// The caveats of [`decrypt_slot`] apply to every slot.
-pub fn decrypt_batch(
-    ctx: &NttContext,
+/// This is [`decrypt_slot`](crate::decrypt_slot) for a payload that
+/// spans several slots, with the same rules for `open` and the same single
+/// failure: every slot is decrypted whatever the others give, a slot that did
+/// not decrypt to a payload reaches `open` as zeros, and the payloads only exist
+/// in heap storage that is zeroized before returning. The batch has one
+/// verdict: slots that are authenticated one by one go through `decrypt_slot`.
+pub fn decrypt_batch<T>(
     sk: &SecretKey,
     cts: &[CiphertextSlot],
-) -> Vec<Plaintext> {
-    cts.par_iter().map(|ct| decrypt_slot(ctx, sk, ct)).collect()
+    open: impl FnOnce(&mut [[u8; SLOT_BYTES]]) -> Option<T>,
+) -> Option<T> {
+    let mut payloads = Payloads::new(cts.len());
+    let slots = payloads.slots().par_iter_mut().zip(cts.par_iter());
+    // The slots that did not decrypt to a payload are counted rather than
+    // combined as truth values. Between threads a result travels in an `Option`,
+    // whose tag shares the byte of a `bool`: testing the tag would then be a jump
+    // on a byte that holds the verdict.
+    let invalid: usize = slots.map(|(payload, ct)| usize::from(!decrypt_into(sk, ct, payload))).sum();
+    // Read once `open` has accepted, as in `decrypt_slot`.
+    open(payloads.slots()).filter(|_| black_box(invalid) == 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoding::{decode, encode};
     use crate::keygen::keygen;
-    use crate::params::{NUM_SLOTS, SLOT_BYTES};
-    use crate::poly::NTT_CONTEXT;
-    use crate::serialize::serialize_slot;
+    use crate::params::{DELTA_T, NUM_SLOTS, T};
     use rand::rngs::StdRng;
 
     fn payloads(count: usize) -> Vec<[u8; SLOT_BYTES]> {
@@ -96,22 +105,54 @@ mod tests {
 
     #[test]
     fn batch_roundtrip_parallel() {
-        let ctx = &NTT_CONTEXT;
         let mut rng = StdRng::seed_from_u64(1);
-        let (sk, pk) = keygen(&mut rng, ctx);
+        let (sk, pk) = keygen(&mut rng);
 
         let data = payloads(32);
-        let messages: Vec<Plaintext> = data.iter().map(encode).collect();
         for flood in [Flooding::Standard, Flooding::Off] {
-            let cts = encrypt_batch(&mut rng, ctx, &pk, &messages, flood);
-            let cts2 = rerandomize_batch(&mut rng, ctx, &pk, &cts);
-            let recovered = decrypt_batch(ctx, &sk, &cts2);
-            assert_eq!(recovered.len(), data.len());
-            for (m, d) in recovered.iter().zip(&data) {
-                assert_eq!(decode(m).expect("valid slot")[..], d[..], "parallel batch roundtrip failed");
-            }
+            let cts = encrypt_batch(&mut rng, &pk, &data, flood);
+            let cts2 = rerandomize_batch(&mut rng, &pk, &cts);
+            let recovered = decrypt_batch(&sk, &cts2, |slots| Some(slots.to_vec()));
+            assert!(recovered.as_ref() == Some(&data), "parallel batch roundtrip failed");
         }
-        assert!(encrypt_batch(&mut rng, ctx, &pk, &[], Flooding::Standard).is_empty());
+        assert!(encrypt_batch(&mut rng, &pk, &[], Flooding::Standard).is_empty());
+        // An empty batch has an empty payload, which `open` judges like any other.
+        assert_eq!(decrypt_batch(&sk, &[], |slots| Some(slots.len())), Some(0));
+    }
+
+    /// One failure for the whole batch: `open` rejecting the payloads, or a slot
+    /// that did not decrypt to one, which `open` then sees as zeros next to the
+    /// payloads of the other slots, and which fails the batch whatever `open`
+    /// answers.
+    #[test]
+    fn batch_decryption_has_one_failure() {
+        let mut rng = StdRng::seed_from_u64(6);
+        let (sk, pk) = keygen(&mut rng);
+        let data = payloads(4);
+        let cts = encrypt_batch(&mut rng, &pk, &data, Flooding::Standard);
+        // What `open` is given, and the outcome when it accepts.
+        let accepted = |cts: &[CiphertextSlot]| {
+            let mut given = Vec::new();
+            let outcome = decrypt_batch(&sk, cts, |slots| {
+                given = slots.to_vec();
+                Some(())
+            });
+            (outcome, given)
+        };
+        assert!(accepted(&cts) == (Some(()), data.clone()));
+        assert_eq!(decrypt_batch(&sk, &cts, |_| None::<()>), None);
+
+        // Every slot in turn: the first coefficient of its message, m, is moved to
+        // t - 1, which is not below 2^31, by adding Delta_t * (t - 1 - m) to c0 in
+        // the t limb.
+        for bad in 0..cts.len() {
+            let (mut cts, mut data) = (cts.clone(), data.clone());
+            let m = u32::from_le_bytes(data[bad][..4].try_into().unwrap()) & 0x7fff_ffff;
+            let shift = (DELTA_T as u64 * (T - 1 - m) as u64 % T as u64) as u32;
+            cts[bad].c0_t[0] = crate::ntt::addmod(cts[bad].c0_t[0], shift, T);
+            data[bad] = [0; SLOT_BYTES];
+            assert!(accepted(&cts) == (None, data), "slot {bad}");
+        }
     }
 
     /// Slots do not share randomness, and neither do two calls made with one
@@ -119,13 +160,12 @@ mod tests {
     /// state would make them.
     #[test]
     fn batch_slots_and_calls_use_independent_randomness() {
-        let ctx = &NTT_CONTEXT;
         let mut rng = StdRng::seed_from_u64(2);
-        let (_sk, pk) = keygen(&mut rng, ctx);
-        let messages: Vec<Plaintext> = payloads(4).iter().map(encode).collect();
+        let (_sk, pk) = keygen(&mut rng);
+        let data = payloads(4);
 
-        let mut cts = encrypt_batch(&mut rng, ctx, &pk, &messages, Flooding::Standard);
-        cts.extend(encrypt_batch(&mut rng, ctx, &pk, &messages, Flooding::Standard));
+        let mut cts = encrypt_batch(&mut rng, &pk, &data, Flooding::Standard);
+        cts.extend(encrypt_batch(&mut rng, &pk, &data, Flooding::Standard));
         for i in 0..cts.len() {
             for j in 0..i {
                 assert_ne!(cts[i].c1_t, cts[j].c1_t, "slots {i} and {j} share randomness");
@@ -140,8 +180,8 @@ mod tests {
             crate::ntt::pointwise_sub(&mut d, &input.c1_q2, crate::params::Q2);
             d
         };
-        let first = rerandomize_batch(&mut rng, ctx, &pk, &cts);
-        let second = rerandomize_batch(&mut rng, ctx, &pk, &cts);
+        let first = rerandomize_batch(&mut rng, &pk, &cts);
+        let second = rerandomize_batch(&mut rng, &pk, &cts);
         let mut deltas: Vec<_> = first.iter().zip(&cts).map(|(o, i)| delta(o, i)).collect();
         deltas.extend(second.iter().zip(&cts).map(|(o, i)| delta(o, i)));
         for i in 0..deltas.len() {
@@ -156,53 +196,47 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, ignore = "slow, and frames are larger, without optimizations")]
     fn nominal_batch_fits_small_worker_stacks() {
-        let ctx = &NTT_CONTEXT;
         let mut rng = StdRng::seed_from_u64(5);
-        let (sk, pk) = keygen(&mut rng, ctx);
+        let (sk, pk) = keygen(&mut rng);
         let data = payloads(NUM_SLOTS);
-        let messages: Vec<Plaintext> = data.iter().map(encode).collect();
 
         let pool = rayon::ThreadPoolBuilder::new().num_threads(16).stack_size(256 * 1024).build().unwrap();
         let recovered = pool.install(|| {
-            let cts = encrypt_batch(&mut rng, ctx, &pk, &messages, Flooding::Standard);
-            let cts = rerandomize_batch(&mut rng, ctx, &pk, &cts);
-            decrypt_batch(ctx, &sk, &cts)
+            let cts = encrypt_batch(&mut rng, &pk, &data, Flooding::Standard);
+            let cts = rerandomize_batch(&mut rng, &pk, &cts);
+            decrypt_batch(&sk, &cts, |slots| Some(slots.to_vec()))
         });
-        assert_eq!(recovered.len(), NUM_SLOTS);
-        for (m, d) in recovered.iter().zip(&data) {
-            assert_eq!(decode(m).expect("valid slot")[..], d[..]);
-        }
+        assert!(recovered == Some(data));
     }
 
     /// Slot `i` uses the generator keyed with the `i`-th 32 bytes of the caller's
     /// generator, whatever the thread that runs it, and `flood` reaches every slot.
     #[test]
     fn batch_matches_sequential_slots() {
-        let ctx = &NTT_CONTEXT;
         let mut rng = StdRng::seed_from_u64(3);
-        let (_sk, pk) = keygen(&mut rng, ctx);
-        let messages: Vec<Plaintext> = payloads(5).iter().map(encode).collect();
+        let (_sk, pk) = keygen(&mut rng);
+        let data = payloads(5);
         // The generators that a batch call gives to its slots when seeded with 4.
         let slot_rngs = || {
             let mut seeder = StdRng::seed_from_u64(4);
-            (0..messages.len()).map(move |_| {
+            (0..data.len()).map(move |_| {
                 let mut seed = [0u8; 32];
                 seeder.fill_bytes(&mut seed);
                 ChaCha20Rng::from_seed(seed)
             })
         };
-        let bytes = |cts: &[CiphertextSlot]| cts.iter().map(serialize_slot).collect::<Vec<_>>();
+        let bytes = |cts: &[CiphertextSlot]| cts.iter().map(CiphertextSlot::to_bytes).collect::<Vec<_>>();
 
         let mut cts = Vec::new();
         for flood in [Flooding::Off, Flooding::Standard] {
-            let slots = messages.iter().zip(slot_rngs());
-            let expected: Vec<_> = slots.map(|(m, mut rng)| encrypt_slot(&mut rng, ctx, &pk, m, flood)).collect();
-            cts = encrypt_batch(&mut StdRng::seed_from_u64(4), ctx, &pk, &messages, flood);
+            let slots = data.iter().zip(slot_rngs());
+            let expected: Vec<_> = slots.map(|(d, mut rng)| encrypt_slot(&mut rng, &pk, d, flood)).collect();
+            cts = encrypt_batch(&mut StdRng::seed_from_u64(4), &pk, &data, flood);
             assert!(bytes(&cts) == bytes(&expected), "encrypt_batch, {flood:?}");
         }
         let slots = cts.iter().zip(slot_rngs());
-        let expected: Vec<_> = slots.map(|(ct, mut rng)| rerandomize_slot(&mut rng, ctx, &pk, ct)).collect();
-        let rerandomized = rerandomize_batch(&mut StdRng::seed_from_u64(4), ctx, &pk, &cts);
+        let expected: Vec<_> = slots.map(|(ct, mut rng)| rerandomize_slot(&mut rng, &pk, ct)).collect();
+        let rerandomized = rerandomize_batch(&mut StdRng::seed_from_u64(4), &pk, &cts);
         assert!(bytes(&rerandomized) == bytes(&expected), "rerandomize_batch");
     }
 }

@@ -1,55 +1,54 @@
 use criterion::{criterion_group, criterion_main, Criterion, black_box};
 use pq_rerand::params::*;
-use pq_rerand::poly::NTT_CONTEXT;
-use pq_rerand::keygen::keygen;
-use pq_rerand::encoding::encode;
-use pq_rerand::encrypt::{encrypt_slot, Flooding};
-use pq_rerand::decrypt::decrypt_slot;
-use pq_rerand::rerandomize::rerandomize_slot;
+use pq_rerand::{decrypt_slot, encrypt_slot, keygen, rerandomize_slot, Flooding};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::time::Duration;
 
+/// Stands for the authenticated decryption of an application: it is handed the
+/// payload and accepts it.
+fn open(payload: &mut [u8; SLOT_BYTES]) -> Option<u8> {
+    Some(black_box(payload)[0])
+}
+
 fn bench_single_slot(c: &mut Criterion) {
-    let ctx = &NTT_CONTEXT;
     let mut rng = StdRng::seed_from_u64(12345);
-    let (sk, pk) = keygen(&mut rng, ctx);
+    let (sk, pk) = keygen(&mut rng);
 
-    let message = encode(&std::array::from_fn(|i| i as u8));
+    let payload: [u8; SLOT_BYTES] = std::array::from_fn(|i| i as u8);
 
-    let ct = encrypt_slot(&mut rng, ctx, &pk, &message, Flooding::Standard);
+    let ct = encrypt_slot(&mut rng, &pk, &payload, Flooding::Standard);
 
     c.bench_function("keygen", |b| {
-        b.iter(|| keygen(&mut rng, ctx))
+        b.iter(|| keygen(&mut rng))
     });
 
     c.bench_function("encrypt_slot (base+smudge)", |b| {
         b.iter(|| {
-            encrypt_slot(&mut rng, ctx, &pk, black_box(&message), Flooding::Standard)
+            encrypt_slot(&mut rng, &pk, black_box(&payload), Flooding::Standard)
         })
     });
 
     c.bench_function("rerandomize_slot", |b| {
         b.iter(|| {
-            rerandomize_slot(&mut rng, ctx, &pk, black_box(&ct))
+            rerandomize_slot(&mut rng, &pk, black_box(&ct))
         })
     });
 
     c.bench_function("decrypt_slot", |b| {
         b.iter(|| {
-            decrypt_slot(ctx, &sk, black_box(&ct))
+            decrypt_slot(&sk, black_box(&ct), open)
         })
     });
 }
 
 fn bench_full_message(c: &mut Criterion) {
-    let ctx = &NTT_CONTEXT;
     let mut rng = StdRng::seed_from_u64(99999);
-    let (sk, pk) = keygen(&mut rng, ctx);
+    let (sk, pk) = keygen(&mut rng);
 
-    let message = encode(&std::array::from_fn(|i| i as u8));
+    let payload: [u8; SLOT_BYTES] = std::array::from_fn(|i| i as u8);
     let slots: Vec<_> = (0..NUM_SLOTS)
-        .map(|_| encrypt_slot(&mut rng, ctx, &pk, &message, Flooding::Standard))
+        .map(|_| encrypt_slot(&mut rng, &pk, &payload, Flooding::Standard))
         .collect();
 
     // Heavy 15.5 MiB batch ops (single-threaded); fewer samples to keep wall-clock
@@ -61,14 +60,14 @@ fn bench_full_message(c: &mut Criterion) {
     group.bench_function("rerandomize (single-threaded)", |b| {
         b.iter(|| {
             let _: Vec<_> = slots.iter()
-                .map(|ct| rerandomize_slot(&mut rng, ctx, &pk, black_box(ct)))
+                .map(|ct| rerandomize_slot(&mut rng, &pk, black_box(ct)))
                 .collect();
         })
     });
     group.bench_function("decrypt (single-threaded)", |b| {
         b.iter(|| {
             let _: Vec<_> = slots.iter()
-                .map(|ct| decrypt_slot(ctx, &sk, black_box(ct)))
+                .map(|ct| decrypt_slot(&sk, black_box(ct), open))
                 .collect();
         })
     });

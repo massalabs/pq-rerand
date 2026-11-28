@@ -1,9 +1,9 @@
 //! Encryption: base BFV encrypt + noise-flooding smudge.
 
-use crate::params::{N, T, Q2, DELTA_T};
+use crate::params::{N, T, Q2, DELTA_T, SLOT_BYTES};
 use crate::ntt::{pointwise_mul, mul_shoup, shoup, addmod};
-use crate::poly::{NttContext, add_signed, secret, set_signed, zeroed};
-use crate::encoding::Plaintext;
+use crate::poly::{NTT_CONTEXT, add_signed, secret, set_signed, zeroed};
+use crate::encoding::encode;
 use crate::keygen::PublicKey;
 use crate::sampling::{add_flood, sample_gaussian_cdt, wiped};
 use rand_core::{CryptoRng, Rng};
@@ -58,11 +58,11 @@ pub enum Flooding {
 /// in the stack frame of this function, which is then overwritten as well.
 pub(crate) fn encrypt_zero<R: Rng + CryptoRng>(
     rng: &mut R,
-    ctx: &NttContext,
     pk: &PublicKey,
     flood: Flooding,
     ct: &mut CiphertextSlot,
 ) {
+    let ctx = &NTT_CONTEXT;
     // Sample base-width noise (constant-time CDT) and flood-width noise, then add
     // them coefficient-wise. The base encryption and the flooding Enc(0) are both
     // linear in their randomness/noise, so a separate smudge step
@@ -107,24 +107,26 @@ pub(crate) fn encrypt_zero<R: Rng + CryptoRng>(
     add_signed(&mut ct.c0_t, &mut ct.c0_q2, &e2);
 }
 
-/// Encrypt a single plaintext slot (see [`encode`](crate::encoding::encode)).
-/// Performs base encryption + noise-flooding smudge, as selected by `flood`.
+/// Encrypt a single slot: the `SLOT_BYTES` bytes of `payload`, which the
+/// application has authenticated (see the crate documentation). Performs base
+/// encryption + noise-flooding smudge, as selected by `flood`.
 ///
 /// The RNG must be cryptographically secure (enforced via the [`CryptoRng`]
-/// marker bound). The encryption randomness reveals the plaintext: it only ever
-/// exists in heap storage that is zeroized before returning.
+/// marker bound). The encryption randomness reveals the payload: like the message
+/// polynomial that encodes the payload, it only ever exists in heap storage that
+/// is zeroized before returning.
 ///
 /// `pk` must be authentic (see [`PublicKey`]).
 pub fn encrypt_slot<R: Rng + CryptoRng>(
     rng: &mut R,
-    ctx: &NttContext,
     pk: &PublicKey,
-    message: &Plaintext,
+    payload: &[u8; SLOT_BYTES],
     flood: Flooding,
 ) -> CiphertextSlot {
     let mut ct = CiphertextSlot::zeroed();
     wiped(|| {
-        encrypt_zero(rng, ctx, pk, flood, &mut ct);
+        encrypt_zero(rng, pk, flood, &mut ct);
+        let message = encode(payload);
 
         // Add Delta_t * M to c0_t (the message lives in the t limb only), in the
         // wiped frame as well: a compiler may keep coefficients of the message on
