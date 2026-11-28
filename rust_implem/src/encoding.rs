@@ -159,6 +159,11 @@ mod tests {
             m.0[i] = 1 << 31;
             assert!(decoded(&m).is_none(), "coefficient {i} = 2^31 accepted");
         }
+        // Two of them: the second one does not cancel the first in the verdict.
+        let mut pair = Plaintext(secret());
+        pair.0[0] = 1 << 31;
+        pair.0[N - 1] = 1 << 31;
+        assert!(decoded(&pair).is_none(), "two coefficients of 2^31 accepted");
         // The largest canonical value is accepted everywhere.
         let mut largest = Plaintext(secret());
         largest.0.fill((1 << 31) - 1);
